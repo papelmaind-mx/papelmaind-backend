@@ -5,7 +5,7 @@ Sprint 1 solo requiere cerrar RFC-024 (bloque de claves).
 
 | RFC     | Fix | Prioridad | Bloquea | Motivo                                      | Estado   |
 |---------|-----|-----------|---------|---------------------------------------------|----------|
-| RFC-024 | F24 | media     | S1      | catalogo_claves_config ausente              | pendiente |
+| RFC-024 | F24 | media     | S1      | catalogo_claves_config ausente              | ✅ cerrado |
 | RFC-035 | F35 | alta      | S8/P1   | validate=False + break en limbo (outbox)    | pendiente |
 | RFC-036 | F36 | alta      | S5      | decremento reserva incondicional en FEFO    | pendiente |
 | RFC-037 | F37 | media     | S4      | Traslados vacío en líneas exentas (XSD SAT) | pendiente |
