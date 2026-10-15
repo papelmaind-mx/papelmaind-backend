@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.bak
+*.bak2
+*.bak_fix
+.env
+.venv/
+node_modules/

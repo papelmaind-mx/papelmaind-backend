@@ -1,0 +1,44 @@
+name: Canon Lint (F28)
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'context-engineer/**/*.xml'
+      - 'scripts/canon_lint.py'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'context-engineer/**/*.xml'
+      - 'scripts/canon_lint.py'
+
+jobs:
+  lint-canon:
+    name: Validar canon XML
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Detectar XML canon
+        id: detect
+        run: |
+          XML_FILE=$(ls -t context-engineer/papelmind_context_engineer_v*.xml 2>/dev/null | head -1)
+          if [ -z "$XML_FILE" ]; then
+            echo "❌ No se encontró XML canon"
+            exit 1
+          fi
+          echo "xml_file=$XML_FILE" >> $GITHUB_OUTPUT
+      - name: Correr canon_lint.py
+        run: python3 scripts/canon_lint.py --verbose "${{ steps.detect.outputs.xml_file }}"
+  validate-xml:
+    name: Validar XML well-formed
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo apt-get update && sudo apt-get install -y libxml2-utils
+      - run: |
+          XML_FILE=$(ls -t context-engineer/papelmind_context_engineer_v*.xml 2>/dev/null | head -1)
+          xmllint --noout "$XML_FILE"
+          echo "✅ XML well-formed"
