@@ -9,7 +9,7 @@ Sprint 1 solo requiere cerrar RFC-024 (bloque de claves).
 | RFC-035 | F35 | alta      | S8/P1   | validate=False + break en limbo (outbox)    | pendiente |
 | RFC-036 | F36 | alta      | S5      | decremento reserva incondicional en FEFO    | pendiente |
 | RFC-037 | F37 | media     | S4      | Traslados vacío en líneas exentas (XSD SAT) | pendiente |
-| RFC-038 | F38 | crítica   | S3      | columna trace_id fantasma en outbox_eventos | pendiente |
+| RFC-038 | F38 | crítica   | S3      | columna trace_id fantasma en outbox_eventos | ✅ cerrado |
 | RFC-ST  | F22/F28 | media  | S4+     | Anexos S/T degradados a stubs               | pendiente |
 
 ## Detalle técnico

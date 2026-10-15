@@ -415,10 +415,13 @@ FROM tlotes l WHERE l.estado NOT IN ('vencido','devuelto') GROUP BY 1, 2, 3;
   <campo name="intentos" type="INT" default="0" desc="SOLO fallos de publicación Kafka (P1+). En P0 los consumers son idempotentes y re-intentan por diseño; los errores de DOMINIO viven en el agregado (ej. estado_cfdi='error_dlq')."/>
   <campo name="error_ultimo" type="TEXT" nullable="true"/>
   <campo name="procesado_en" type="TIMESTAMPTZ" nullable="true"/>
+  <campo name="trace_id" type="VARCHAR(64)" nullable="true" estado="F38"
+         desc="Correlación distribuida. Puede venir del payload o generarse al insertar. Worker outbox lo proyecta al envelope."/>
   <campo name="created_at" type="TIMESTAMPTZ" default="NOW()"/>
   <indices>
     idx_outbox_loyalty_p0 (created_at) WHERE tipo='sale.completed' AND procesado_loyalty=false
     idx_outbox_kafka_p1 (created_at) WHERE publicado_kafka=false AND intentos&lt;3
+    idx_outbox_trace (trace_id) WHERE trace_id IS NOT NULL
   </indices>
 </modelo>
 

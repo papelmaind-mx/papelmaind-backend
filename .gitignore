@@ -6,3 +6,5 @@ __pycache__/
 .env
 .venv/
 node_modules/
+*d3_xml.txt
+*.txt.bak
