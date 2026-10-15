@@ -1,0 +1,33 @@
+<!-- RFC-024 / F24 — restaurar en Sección 2 -->
+<modelo nombre="catalogo_claves_config" estado="F24">
+  <desc>Claves de configuración permitidas por tenant. Seed y runtime SOLO pueden usar claves de este catálogo.</desc>
+  <campo name="id" type="UUID" pk="true"/>
+  <campo name="clave" type="VARCHAR(64)" unique="true" not_null="true"/>
+  <campo name="tipo" type="VARCHAR(16)" check="IN ('string','int','bool','json','decimal')"/>
+  <campo name="descripcion" type="TEXT"/>
+  <campo name="valor_default" type="TEXT" nullable="true"/>
+  <campo name="ambito" type="VARCHAR(16)" check="IN ('global','papeleria','sucursal')" default="'papeleria'"/>
+  <campo name="activo" type="BOOLEAN" default="true"/>
+</modelo>
+
+<!-- Seed mínimo de claves canónicas (18) -->
+<seed tabla="catalogo_claves_config" fix="F24">
+  <fila clave="zona_horaria" tipo="string" valor_default="America/Mexico_City" ambito="papeleria"/>
+  <fila clave="moneda" tipo="string" valor_default="MXN" ambito="papeleria"/>
+  <fila clave="iva_default" tipo="decimal" valor_default="0.16" ambito="papeleria"/>
+  <fila clave="peso_validacion" tipo="string" valor_default="advertencia" ambito="papeleria"/>
+  <fila clave="stock_minimo_default" tipo="int" valor_default="5" ambito="sucursal"/>
+  <fila clave="reserva_carrito_minutos" tipo="int" valor_default="30" ambito="papeleria"/>
+  <fila clave="folio_prefijo" tipo="string" valor_default="PM" ambito="papeleria"/>
+  <fila clave="cfdi_serie" tipo="string" valor_default="A" ambito="papeleria"/>
+  <fila clave="cfdi_lugar_expedicion" tipo="string" valor_default="" ambito="papeleria"/>
+  <fila clave="whatsapp_enabled" tipo="bool" valor_default="false" ambito="papeleria"/>
+  <fila clave="loyalty_enabled" tipo="bool" valor_default="true" ambito="papeleria"/>
+  <fila clave="kafka_enabled" tipo="bool" valor_default="false" ambito="global"/>
+  <fila clave="outbox_batch_size" tipo="int" valor_default="50" ambito="global"/>
+  <fila clave="dlq_max_intentos" tipo="int" valor_default="5" ambito="global"/>
+  <fila clave="pos_offline_max_horas" tipo="int" valor_default="72" ambito="papeleria"/>
+  <fila clave="arqueo_tolerancia" tipo="decimal" valor_default="0.50" ambito="sucursal"/>
+  <fila clave="session_ttl_minutos" tipo="int" valor_default="480" ambito="global"/>
+  <fila clave="feature_aparados" tipo="bool" valor_default="false" ambito="papeleria"/>
+</seed>
