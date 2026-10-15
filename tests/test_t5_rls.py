@@ -3,5 +3,5 @@ import pytest
 
 @pytest.mark.asyncio
 async def test_rls_isolation_between_tenants():
-    """Usuario de papelería A no ve filas de papelería B."""
-    pytest.skip("Implementar en Sprint 1")
+    """Usuario de papelería A no ve filas de papelería B con set_current_tenant."""
+    pytest.skip("Conectar DB de test + políticas RLS en S1")

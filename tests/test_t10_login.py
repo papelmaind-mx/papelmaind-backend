@@ -4,4 +4,4 @@ import pytest
 @pytest.mark.asyncio
 async def test_login_first_relation():
     """Login resuelve papeleria_id desde la primera relación activa."""
-    pytest.skip("Implementar en Sprint 1")
+    pytest.skip("Implementar endpoint /auth/login + seed en S1")
