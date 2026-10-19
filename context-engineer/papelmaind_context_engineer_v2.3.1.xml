@@ -1315,10 +1315,11 @@ LIMIT 5;
 <embeddings_provider>openai:text-embedding-3-small 1536d</embeddings_provider>
 </nivel2>
 <nivel3 name="LLM-chain">
-<prompt canon>
+<prompt><canon>
 Eres el asistente de {tenant_nombre}. Con este contexto: {top5}
 responde amable y breve en {lang}. NO inventes stock ni precios.
 Si no sabes, ofrece escalar a un asesor humano.
+</canon>
 </prompt>
 <guardrails>
 PII masking (wa_id→SHA-256) ANTES de LLM
@@ -1331,7 +1332,7 @@ max_tokens=500, temperature=0.3
 
 <!-- ============ IA LOOP — 5 AGENTES LANGGRAPH ============ -->
 <ia_loop orquestador="LangGraph" checkpointing="true" human_in_the_loop="true">
-<orquestador codigo><![CDATA[
+<orquestador><codigo><![CDATA[
 # src/application/ia_loop/langgraph_orchestrator.py
 from langgraph.graph import StateGraph, END
 from typing import TypedDict, Annotated
@@ -1368,6 +1369,7 @@ def build_graph():
         graph.add_edge(node, END)
     return graph.compile()
 ]]></codigo>
+</orquestador>
 
 <agente id="1" nombre="Concierge Omnicanal" trigger="whatsapp.inbound.received">
 <acciones>
@@ -2833,7 +2835,7 @@ canon v2.3.1 se regenera con el lint.
 <enmienda id="RFC-032" fix="F32" motivo="`loyalty_worker` usaba `ANY(:ids)` sin CAST para asyncpg" secciones="7" estado="aceptada" fecha="2026"/>
 <enmienda id="RFC-033" fix="F33" motivo="CFDI `ObjetoImp` siempre '02' incluso para exentos" secciones="6" estado="aceptada" fecha="2026"/>
 <enmienda id="RFC-034" fix="F34" motivo="`notification_worker` unificado (9 workers totales, email/push son colas internas)" secciones="7" estado="aceptada" fecha="2026"/>
-<enmienda id="RFC-035" fix="F35" motivo="CFDI corregido: `<` reales en CDATA (no `&lt;` escapados)" secciones="6" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-035" fix="F35" motivo="CFDI corregido: `&lt;` reales en CDATA (no `&lt;` escapados)" secciones="6" estado="aceptada" fecha="2026"/>
 <enmienda id="RFC-036" fix="F36" motivo="Token WhatsApp por tenant desde `papeleria_api_keys`" secciones="5,7" estado="aceptada" fecha="2026"/>
 <enmienda id="RFC-037" fix="F37" motivo="UNIQUE parcial en `whatsapp_phone_number_id`" secciones="5" estado="aceptada" fecha="2026"/>
 <enmienda id="RFC-038" fix="F38" motivo="Helpers canonizados (`getNextFolio`, `get_config_value`, `sweep_reservations_once`)" secciones="3,5,7" estado="aceptada" fecha="2026"/>
