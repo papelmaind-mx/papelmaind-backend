@@ -1,0 +1,1606 @@
+<!-- ============================================================================ -->
+<!-- SECCIÓN 9: INFRAESTRUCTURA + TESTING (T1-T12 + k6 ×5 + Sprint 4.5) — F23    -->
+<!-- ============================================================================ -->
+<seccion_9_infra_testing fase="P0-P3" version="2.3.1">
+<!-- ============ DOCKER COMPOSE CANON (F23: 9 workers + frontends + ancla usada) ============ -->
+<docker_compose canon="P0 VPS" archivo="docker-compose.yml" fix="F23">
+<descripcion>
+F23: el compose restaura los 9 workers + web + checkout + reservation-sweeper, todos usando
+`*worker-env` y `*backend-common`. Kiosco = estático (lo sirve `web` vía /kiosco).
+</descripcion>
+<codigo><![CDATA[
+version: "3.9"
+x-backend-common: &amp;backend-common
+  build:
+    context: ./backend
+    dockerfile: Dockerfile.dev
+  restart: unless-stopped
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+    kafka: { condition: service_healthy }
+x-worker-env: &amp;worker-env
+  WORKER_DATABASE_URL: postgresql+asyncpg://erp_worker:${WORKER_DB_PASSWORD:-worker_change_me}@postgres:5432/papeleria
+  REDIS_URL: redis://redis:6379/0
+  KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+  ENCRYPTION_KEY: ${ENCRYPTION_KEY:-Z2VuZXJhdGVfdHVfZmVybmV0X2tleV9lbl9wcm9kdWNjaW9uX2FxdWk=}
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: erp_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: papeleria
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-admin_change_me}
+    ports: ["5432:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-scripts/01-extensions.sql:/docker-entrypoint-initdb.d/01-extensions.sql:ro
+      - ./docker/init-scripts/02-roles.sql:/docker-entrypoint-initdb.d/02-roles.sql:ro
+      - ./docker/init-scripts/03-functions.sql:/docker-entrypoint-initdb.d/03-functions.sql:ro
+      - ./docker/init-scripts/04-rls-suite.sql:/docker-entrypoint-initdb.d/04-rls-suite.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d papeleria"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    command: ["postgres", "-c", "max_connections=100", "-c", "log_min_duration_statement=500"]
+  redis:
+    image: redis:7-alpine
+    container_name: erp_redis
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+  kafka:
+    image: bitnami/kafka:3.7
+    container_name: erp_kafka
+    restart: unless-stopped
+    ports: ["9092:9092"]
+    environment:
+      KAFKA_CFG_NODE_ID: 1
+      KAFKA_CFG_PROCESS_ROLES: broker,controller
+      KAFKA_CFG_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_CFG_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CFG_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CFG_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CFG_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_CFG_NUM_PARTITIONS: 6
+      KAFKA_CFG_DEFAULT_REPLICATION_FACTOR: 1
+      ALLOW_PLAINTEXT_LISTENER: "yes"
+    volumes:
+      - kafkadata:/bitnami/kafka
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&amp;1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+  api:
+    <<: *backend-common
+    container_name: erp_api
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      DATABASE_URL: postgresql+asyncpg://erp_app:${APP_DB_PASSWORD:-app_change_me}@postgres:5432/papeleria
+      WORKER_DATABASE_URL: postgresql+asyncpg://erp_worker:${WORKER_DB_PASSWORD:-worker_change_me}@postgres:5432/papeleria
+      REDIS_URL: redis://redis:6379/0
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      JWT_SECRET: ${JWT_SECRET:-cambiar_en_prod_minimo_64_chars_aqui_para_seguridad}
+      JWT_ALGORITHM: HS256
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-Z2VuZXJhdGVfdHVfZmVybmV0X2tleV9lbl9wcm9kdWNjaW9uX2FxdWk=}
+      DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      ENVIRONMENT: ${ENVIRONMENT:-development}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    ports: ["8000:8000"]
+    volumes:
+      - ./backend:/app
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+  # F23: LOS 9 WORKERS (usando *worker-env — ancla ya NO huérfana)
+  outbox-worker:
+    <<: *backend-common
+    container_name: erp_outbox_worker
+    command: python -m src.infrastructure.workers.outbox_worker
+    environment: { <<: *worker-env }
+  loyalty-worker:
+    <<: *backend-common
+    container_name: erp_loyalty_worker
+    command: python -m src.infrastructure.workers.loyalty_worker
+    environment: { <<: *worker-env }
+  cfdi-worker:
+    <<: *backend-common
+    container_name: erp_cfdi_worker
+    command: python -m src.infrastructure.workers.cfdi_worker
+    environment: { <<: *worker-env }
+  inventory-alert-worker:
+    <<: *backend-common
+    container_name: erp_inventory_alert_worker
+    command: python -m src.infrastructure.workers.inventory_alert_worker
+    environment: { <<: *worker-env }
+  notification-worker:
+    <<: *backend-common
+    container_name: erp_notification_worker
+    command: python -m src.infrastructure.workers.notification_worker
+    environment: { <<: *worker-env }
+  ia-loop-worker:
+    <<: *backend-common
+    container_name: erp_ia_loop_worker
+    command: python -m src.infrastructure.workers.ia_loop_worker
+    environment: { <<: *worker-env }
+  reservation-sweeper:
+    <<: *backend-common
+    container_name: erp_reservation_sweeper
+    command: python -m src.infrastructure.workers.reservation_sweeper
+    environment: { <<: *worker-env }
+  ai-campaign-worker:
+    <<: *backend-common
+    container_name: erp_ai_campaign_worker
+    command: python -m src.infrastructure.workers.ai_campaign_worker
+    environment: { <<: *worker-env }
+  dlq-consumer:
+    <<: *backend-common
+    container_name: erp_dlq_consumer
+    command: python -m src.infrastructure.workers.dlq_consumer
+    environment: { <<: *worker-env }
+  # F23: FRONTENDS
+  web:
+    build: { context: ./frontend/web, dockerfile: Dockerfile.dev }
+    container_name: erp_web
+    command: npm run dev
+    ports: ["3000:3000"]
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000/api/v1
+    volumes:
+      - ./frontend/web:/app
+      - /app/node_modules
+      - /app/.next
+  checkout:
+    build: { context: ./frontend/checkout, dockerfile: Dockerfile.dev }
+    container_name: erp_checkout
+    command: npm run dev -- --port 5174
+    ports: ["5174:5174"]
+    environment:
+      VITE_API_URL: http://localhost:8000/api/v1
+    volumes:
+      - ./frontend/checkout:/app
+      - /app/node_modules
+  # kiosco = estático: lo sirve 'web' vía /kiosco (teclado-regen.html) — sin servicio propio
+  # OBSERVABILIDAD
+  prometheus:
+    image: prom/prometheus:v2.48.0
+    container_name: erp_prometheus
+    restart: unless-stopped
+    ports: ["9090:9090"]
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/alerts.rules.yml:/etc/prometheus/alerts.rules.yml:ro
+      - prometheus_data:/prometheus
+  grafana:
+    image: grafana/grafana:10.2.0
+    container_name: erp_grafana
+    restart: unless-stopped
+    ports: ["3001:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+  jaeger:
+    image: jaegertracing/all-in-one:1.51
+    container_name: erp_jaeger
+    restart: unless-stopped
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    environment:
+      COLLECTOR_OTLP_ENABLED: "true"
+  loki:
+    image: grafana/loki:2.9.0
+    container_name: erp_loki
+    restart: unless-stopped
+    ports: ["3100:3100"]
+    volumes:
+      - ./docker/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - lokidata:/loki
+networks:
+  default:
+    name: erp_network
+    driver: bridge
+volumes:
+  pgdata:
+  redisdata:
+  kafkadata:
+  prometheus_data:
+  grafana_data:
+  lokidata:
+]]></codigo>
+</docker_compose>
+
+<!-- ============ TESTING SUITE (T1-T12) ============ -->
+<testing canon="Suite E2E completa">
+<estructura>
+backend/tests/
+├── conftest.py                    # Fixtures globales + test_engine + seed
+├── fixtures/
+│   └── seed_data.py               # 2 tenants + 3 usuarios + cajas + sucursales
+├── e2e/
+│   ├── test_auth_flow.py          # Sprint 1: login multi-tenant + refresh
+│   ├── test_multi_tenant.py       # Sprint 1: RLS disjoint (T5)
+│   ├── test_pos_sync_flow.py      # Sprint 3: T1 idempotencia + T2 FEFO + T3 concurrencia
+│   ├── test_cash_flow.py          # Sprint 3: T7 caja por caja
+│   ├── test_fiscal_flow.py        # Sprint 4: T8 CFDI global
+│   ├── test_reservation_sweeper.py # Sprint 3.5: T12 sweeper ↔ vw_stock_sucursal (F20)
+│   ├── test_ecommerce_flow.py     # Sprint 5: carrito + reserva
+│   ├── test_checkout_flow.py      # Sprint 6: checkout MP
+│   ├── test_webhook_payments.py   # Sprint 6: T6 webhook flow
+│   ├── test_whatsapp_webhook.py   # Sprint 7: T11 webhook tenant isolation (F19)
+│   ├── test_rag_pipeline.py       # Sprint 7: LLM gateway + PII
+│   ├── test_ia_loop_agents.py     # Sprint 7: 5 agentes
+│   ├── test_shipping_flow.py      # Sprint 8: courier hub
+│   ├── test_kafka_publish.py      # Sprint 8: schemas + envelope
+│   ├── test_courier_hub.py        # Sprint 8: haversine + cotización
+│   ├── test_kiosco_flow.py        # Sprint 9: autocheckout
+│   ├── test_casbin_permissions.py # Sprint 9: RBAC
+│   ├── test_campanas_flow.py      # Sprint 10: RFM + campañas
+│   ├── test_contabilidad_flow.py  # Sprint 10: pólizas + balance
+│   ├── test_soporte_flow.py       # Sprint 11: tickets
+│   ├── test_carga_masiva_flow.py  # Sprint 11: preview + aplicar
+│   ├── test_comisiones_flow.py    # Sprint 11: comisiones + dispersión
+│   └── test_dlq_flow.py           # Sprint 12: DLQ console
+├── integration/
+│   ├── test_outbox_worker.py      # F17: verifica P0-aware + flags separados
+│   ├── test_loyalty_worker.py     # F17: verifica procesado_loyalty
+│   ├── test_cfdi_worker.py
+│   └── test_dlq_consumer.py
+├── smoke/
+│   ├── test_health.py             # Sprint 0: /health + /ready + /metrics
+│   └── smoke_test.sh              # Script bash para CI/CD
+└── performance/
+    ├── k6-baseline.js             # Sprint 4.5
+    ├── k6-regreso-clases.js
+    ├── k6-black-friday.js
+    ├── k6-cold-start.js
+    ├── k6-dlq-storm.js
+    └── README.md
+</estructura>
+
+<tests_criticos total="12">
+<test id="T1" nombre="idempotencia_pos" sprint="S3">
+<descripcion>Mismo client_uuid 2× → 201 created + 200 duplicated; stock baja UNA vez</descripcion>
+</test>
+<test id="T2" nombre="fefo_orden" sprint="S3">
+<descripcion>2 lotes (vence 30d vs 365d) + venta 15 → cercano agotado(0,'agotado'), lejano parcial(5)</descripcion>
+</test>
+<test id="T3" nombre="concurrencia_stock" sprint="S3">
+<descripcion>asyncio.gather 2 cajas × 60u (stock 100) → exactamente 1 exitosa</descripcion>
+</test>
+<test id="T4" nombre="idempotencia_carga" sprint="S3">
+<descripcion>10 syncs concurrentes mismo client_uuid → 1 created + 9 duplicated</descripcion>
+</test>
+<test id="T5" nombre="rls_disjoint" sprint="S1">
+<descripcion>Admin A vs B listan artículos → conjuntos disjuntos; A GET id de B → 404</descripcion>
+</test>
+<test id="T6" nombre="webhook_flow" sprint="S6">
+<descripcion>carrito(no descuenta) → checkout(pendiente) → webhook(approved) → stock −3 + completada + outbox; re-entrega → duplicate</descripcion>
+</test>
+<test id="T7" nombre="caja_por_caja" sprint="S3">
+<descripcion>2 cajas paralelas: cortes independientes + arqueo correcto por caja + UNIQUE corte abierto por caja</descripcion>
+</test>
+<test id="T8" nombre="cfdi_global" sprint="S4">
+<descripcion>3 ventas sin CFDI + job nocturno → 1 global con 3 ids + UNIQUE parcial individual respetado</descripcion>
+</test>
+<test id="T9" nombre="dlq_terminal" sprint="S4">
+<descripcion>Evento con 3 fallos → NO re-seleccionado + fila en tdlq_eventos + replay individual OK + batch &gt;1000 → 400</descripcion>
+</test>
+<test id="T10" nombre="worker_engine" sprint="S4">
+<descripcion>Worker con WorkerSessionLocal ve multi-tenant; validar que AsyncSessionLocal SIN tenant devuelve 0 filas (regresión F1)</descripcion>
+</test>
+<test id="T11" nombre="webhook_tenant_isolation" sprint="S7" fix="F19" bloqueante="true">
+<descripcion>
+2 tenants (A/B) con whatsapp_phone_number_id distintos. Webhook entrante con
+número RECEPTOR de A pero wa_id de un cliente de B → 100% de escrituras
+(tmensajes, rel, carrito) aterrizan en A. Admin de B lista tmensajes → 0 filas.
+Cubre F19. Regresión: cualquier handler que "olvide" el SET rompe este test.
+</descripcion>
+<codigo><![CDATA[
+async def test_webhook_tenant_isolation(client, seed_two_tenants):
+    tenant_a, tenant_b = seed_two_tenants
+    payload = build_meta_webhook(
+        phone_number_id=tenant_a.whatsapp_phone_number_id,
+        wa_id=tenant_b.cliente.wa_id,
+        mensaje="hola",
+    )
+    resp = await client.post("/api/v1/whatsapp/webhook", json=payload)
+    assert resp.status_code == 200
+    async with TenantUnitOfWork(tenant_b.id) as session:
+        msgs = (await session.execute(select(TMensaje))).scalars().all()
+        assert len(msgs) == 0, "F19 roto: escritura cross-tenant"
+    async with TenantUnitOfWork(tenant_a.id) as session:
+        msgs = (await session.execute(select(TMensaje))).scalars().all()
+        assert len(msgs) == 1
+]]></codigo>
+</test>
+<test id="T12" nombre="sweeper_vw_stock_sucursal_consistencia" sprint="S3.5" fix="F20">
+<descripcion>
+Carrito + reservar 5u → tarticulos.stock_reservado=5. Expirar reservas →
+sweeper → assert stock_reservado=0 AND para cada artículo:
+vw_stock_sucursal.disponible_sucursal == tarticulos.stock_actual − tarticulos.stock_reservado.
+Verifica que el sweeper libera al MISMO nivel que reserva (artículo, no lote).
+</descripcion>
+<codigo><![CDATA[
+async def test_sweeper_consistencia_vw_stock(db, seed_articulo_con_lotes):
+    tenant_id = seed_articulo_con_lotes.papeleria_id
+    articulo_id = seed_articulo_con_lotes.id
+    async with TenantUnitOfWork(tenant_id) as session:
+        await reservar_stock(session, tenant_id, articulo_id, Decimal("5"))
+    async with WorkerSessionLocal() as session:
+        await session.execute(text("UPDATE tcarritoitems SET fecha_expiracion_reserva = NOW() - INTERVAL '1 min' WHERE reserva_activa = true"))
+        await session.commit()
+    await sweep_reservations_once()
+    async with TenantUnitOfWork(tenant_id) as session:
+        art = (await session.execute(select(TArticulo).where(TArticulo.id == articulo_id))).scalar_one()
+        assert art.stock_reservado == Decimal("0"), "F20 roto: sweeper no liberó"
+        vw = (await session.execute(text("""
+            SELECT disponible_sucursal FROM vw_stock_sucursal
+            WHERE papeleria_id = :t AND articulo_id = :a
+        """), {"t": str(tenant_id), "a": str(articulo_id)})).scalar()
+        assert Decimal(str(vw)) == art.stock_actual - art.stock_reservado
+]]></codigo>
+</test>
+</tests_criticos>
+
+<k6_escenarios total="5">
+<escenario id="baseline" desc="Día normal" fase="P0">
+<stages>[30s→20, 1m→50, 30s→0]</stages>
+<thresholds>p95&lt;500ms, fail&lt;1%</thresholds>
+<prerequisito>pool_size=20, max_overflow=10 (P0)</prerequisito>
+</escenario>
+<escenario id="estacional_regreso_clases" desc="Regreso a clases (×1.8)" fase="P1">
+<stages>[1m→50, 3m→90, 2m→90, 1m→0]</stages>
+<thresholds>p95&lt;800ms, fail&lt;2%</thresholds>
+<prerequisito>pool_size=10, max_overflow=5, redis_pool=50</prerequisito>
+</escenario>
+<escenario id="black_friday" desc="Pico extremo (×3)" fase="P2">
+<stages>[2m→100, 5m→200, 3m→200, 2m→0]</stages>
+<thresholds>p95&lt;1500ms, fail&lt;5%</thresholds>
+<prerequisito>pool_size=5+3, PgBouncer activo, HPA ya en 10 pods</prerequisito>
+</escenario>
+<escenario id="cold_start" desc="Nuevo pod arranca en pico" fase="P2">
+<stages>[10s→150, 1m→150, 30s→0]</stages>
+<verifica>Pool calienta bien, RLS seteado en cada conexión nueva</verifica>
+<verifica>Health /ready responde antes de recibir tráfico</verifica>
+</escenario>
+<escenario id="dlq_storm" desc="Inyección de fallos PAC deliberados" fase="P2">
+<stages>20 req/s durante 5 min</stages>
+<thresholds>90-100% errores esperados durante storm</thresholds>
+<verifica>DLQ crece correctamente + alertas A11-A15 disparan + replay batch &lt;5min</verifica>
+</escenario>
+</k6_escenarios>
+
+<sprint_4_5 nombre="Calibración Pre-Producción" estado="OBLIGATORIO" duracion="1 semana">
+<objetivo>Validar que el sistema SOBRE PAPEL (pools, HPA, DLQ, alertas) coincide con la realidad ANTES del primer pilot</objetivo>
+<checklist>
+<item>1. Ejecutar los 5 escenarios k6 contra staging con datos seed completos</item>
+<item>2. Ajustar pool_sizing real según métricas observadas (documentar desviación vs fórmula)</item>
+<item>3. DLQ drill: provocar fallos PAC/TAE deliberados → verificar tdlq_eventos + alertas A11-A15 + replay manual</item>
+<item>4. Validar las 15 alertas disparan y llegan (Slack/email) sin falsos positivos 24h</item>
+<item>5. Backup + restore drill completo (RTO &lt; 30min documentado)</item>
+<item>6. T1-T12 verdes 3 corridas consecutivas</item>
+<item>7. Firmar acta de calibración con cifras reales → actualizar este XML</item>
+</checklist>
+<criterio_salida>RTO/RPO documentados · pools calibrados · DLQ drill aprobado · acta firmada</criterio_salida>
+</sprint_4_5>
+
+<backup canon="P0">
+<estrategia>pg_dump diario + WAL archiving P1 + restore drill mensual</estrategia>
+<redis>RDB cada 15min (cache only — reproducible desde DB)</redis>
+<s3>versionado (XML CFDI, PDFs, logos) — retención fiscal CFDI 5+ años</s3>
+<rto_meta>30 minutos</rto_meta>
+<rpo_meta>5 minutos (con WAL archiving)</rpo_meta>
+</backup>
+</testing>
+
+<!-- ============ KIOSCO PROD BUNDLE (F27) ============ -->
+<kiosco_build estado="F27 — gap de auditoría cerrado">
+<dev canon="single-file teclado-regen.html + React UMD + Babel standalone"/>
+<prod build="vite build --config kiosco.config.ts → dist/index.html autocontenido: JS inline, cero CDN, cero Babel runtime (~50ms arranque), CSP estricta default-src 'self' sin 'unsafe-eval'"/>
+<regla>Sprint 9 (P2) genera kiosco.config.ts + npm run build:kiosco. El single-file queda como DEV/prototipo oficial.</regla>
+<archivos>
+<archivo path="frontend/kiosco/kiosco.config.ts">Config Vite: build → single file inline</archivo>
+<archivo path="frontend/kiosco/index.html">Single-file dev (prototipo oficial, con Babel standalone)</archivo>
+<archivo path="frontend/kiosco/dist/index.html">Bundle prod (generado, sin Babel, CSP estricta)</archivo>
+</archivos>
+</kiosco_build>
+</seccion_9_infra_testing>
+
+<!-- ============================================================================ -->
+<!-- SECCIÓN 10: UML + ANEXOS A-T + REGLAS DE GENERACIÓN — F22 + F28 APLICADOS   -->
+<!-- ============================================================================ -->
+<seccion_10_anexos_reglas fase="Transversal" version="2.3.1">
+<!-- ============ 29 DIAGRAMAS UML EN PLANTUML ============ -->
+<uml_referencias total="29">
+<uml id="1" nombre="Estados Venta+Aparados+Offline"><plantuml><![CDATA[
+@startuml estados-venta
+[*] --> borrador
+borrador --> pendiente_sync : POS cobra offline
+borrador --> pendiente_pago : e-commerce checkout
+pendiente_sync --> completada : sync OK (201)
+pendiente_sync --> conflict : 409 stock
+pendiente_sync --> conflicto_corte_cerrado : 409 corte cerrado
+conflict --> completada : admin resuelve
+conflicto_corte_cerrado --> completada : admin reasigna
+pendiente_pago --> pagada : webhook approved
+pendiente_pago --> cancelada : expira 30min
+pagada --> en_preparacion
+en_preparacion --> empacada
+empacada --> despachada
+despachada --> completada
+completada --> devuelta
+completada --> cancelada
+@enduml
+]]></plantuml></uml>
+<uml id="2" nombre="Estados Stock/Lotes FEFO"><plantuml><![CDATA[
+@startuml estados-lote
+[*] --> disponible : entrada recepción
+disponible --> parcial : venta parcial
+disponible --> reservado : aparado creado
+reservado --> parcial : liquidación FEFO
+disponible --> agotado : cantidad = 0
+parcial --> agotado : cantidad = 0
+disponible --> cuarentena : incidencia dañado
+cuarentena --> disponible : resuelto
+disponible --> vencido : fecha < TODAY
+vencido --> devuelto : devolución proveedor
+agotado --> [*]
+@enduml
+]]></plantuml></uml>
+<uml id="3" nombre="Despliegue Edge+Cloud"><plantuml><![CDATA[
+@startuml despliegue
+node "Cloud (VPS P0 / EKS P2+)" {
+  node "API Pod (3-10 HPA)" {
+    component FastAPI
+    component Uvicorn4
+  }
+  node "Workers (StatefulSet)" {
+    component "outbox_worker"
+    component "loyalty_worker"
+    component "cfdi_worker"
+    component "notification_worker"
+    component "ia_loop_worker"
+    component "inventory_alert"
+    component "reservation_sweeper"
+    component "ai_campaign"
+    component "dlq_consumer"
+  }
+  database "PostgreSQL 16 (RLS)"
+  database Redis7
+  queue Kafka
+}
+node "Edge (Cliente)" {
+  node "POS PWA" { component IndexedDB; component ServiceWorker }
+  node "Kiosco HTML"
+  node "Web Next.js"
+}
+POS --> API : HTTPS + JWT
+Kiosco --> API
+Web --> API
+API --> PostgreSQL : SET LOCAL
+Workers --> PostgreSQL : BYPASSRLS
+Workers --> Kafka
+@enduml
+]]></plantuml></uml>
+<uml id="4" nombre="BPMN Omnicanal"/>
+<uml id="5" nombre="Flujo Negocio Holístico"/>
+<uml id="6" nombre="Actividades Outbox+Conflictos"/>
+<uml id="7" nombre="DFD Nivel 1"/>
+<uml id="8" nombre="Paquetes Clean Architecture"/>
+<uml id="9" nombre="Comunicación Numerada"/>
+<uml id="10" nombre="Componentes+DLQ"/>
+<uml id="11" nombre="Seguridad RLS"/>
+<uml id="12" nombre="RAG Pgvector"/>
+<uml id="13" nombre="C4 Contexto"/>
+<uml id="14" nombre="Topología Red"/>
+<uml id="15" nombre="Secuencia APIs Fiscal PAC-First"/>
+<uml id="16" nombre="Embudo Conversión"/>
+<uml id="17" nombre="MEDVI (Analytics)"/>
+<uml id="18" nombre="Relaciones Entidades"/>
+<uml id="19" nombre="Timing FEFO"/>
+<uml id="20" nombre="Estructura Compuesta"/>
+<uml id="21" nombre="Perfiles (Rendimiento)"/>
+<uml id="22" nombre="Secuencia Venta Completa"/>
+<uml id="23" nombre="Componentes MS Detallado"/>
+<uml id="24" nombre="Secuencia Citas/Aparados/Notificaciones"/>
+<uml id="25" nombre="Estados Fulfillment Empaque"/>
+<uml id="26" nombre="Casos de Uso Consolidado UC-001..UC-062"/>
+<uml id="27" nombre="Clases Parte 1-5"/>
+<uml id="28" nombre="DFD DLQ Operativa v2.1.2"/>
+<uml id="29" nombre="Secuencia Replay-Batch F8"/>
+</uml_referencias>
+
+<!-- ============ ANEXOS A-T ============ -->
+<anexos>
+<anexo id="A" nombre="Mapeo eventos ES→EN">
+<mapeos>
+VENTA_COMPLETADA→sale.completed · VENTA_APARADA→layaway.created · STOCK_*→inventory.stock.*
+· CFDI_SOLICITADO→cfdi.requested · PUNTOS_*→crm.loyalty.points.* · WHATSAPP_*→notifications.whatsapp.*
+· ENVIO_*→logistics.shipment.* · CITA_PROGRAMADA→appointments.booked
+· APARADO_CREADO→layaway.created · TENANT_CREADO→tenant.created
+· topics: ventas.facturadas→sales.order.completed · inventario.stock.actualizado→inventory.stock.changed
+· fiscal.cfdi.solicitado→fiscal.cfdi.requested · crm.fidelizacion.puntos→crm.loyalty.points.moved
+· notificaciones.whatsapp.enviar→notifications.whatsapp.send
+· logistica.envio.actualizado→logistics.shipment.updated
+</mapeos>
+</anexo>
+
+<anexo id="B" nombre="Correcciones acumuladas (CONGELADO histórico v2.1.x)">
+<descripcion>CONGELADO como histórico. F17-F38 se registran vía RFC-lite en el Anexo T.</descripcion>
+<total_fixes_historicos>84 fixes v2.1.x</total_fixes_historicos>
+<nota_v2_3_1>F17-F38 se registran en Anexo T (proceso_enmiendas RFC-lite). El total v2.3.1 lo dicta scripts/canon_lint.py.</nota_v2_3_1>
+</anexo>
+
+<anexo id="C" nombre="Parámetros de negocio (defaults configurables por tenant)">
+<parametro clave="reserva_carrito_min" valor="15"/>
+<parametro clave="ventana_pago_min" valor="30"/>
+<parametro clave="enganche_aparado_pct" valor="30"/>
+<parametro clave="plazo_aparado_dias" valor="30 (+prórroga 7)"/>
+<parametro clave="penalizacion_aparado" valor="10% saldo mín $10 gracia 3d"/>
+<parametro clave="tolerancia_precio" valor="±5% o ±$20 (menor)"/>
+<parametro clave="puntos" valor="P1 1pt/$1 · P2 mult 1.0/1.25/1.5/2.0 · redención 100=$5 mín 500 tope 50%"/>
+<parametro clave="descuadre_warning" valor="±$50"/>
+<parametro clave="punto_reorden" valor="demanda×LT + 1.65σ√LT"/>
+<parametro clave="estacionalidad_regreso_clases" valor="×1.8 jul-ago+ene"/>
+<parametro clave="estacionalidad_black_friday" valor="×2.5 nov"/>
+<parametro clave="dlq_max_intentos" valor="3"/>
+<parametro clave="dlq_replay_batch_max" valor="1000"/>
+<parametro clave="dlq_replayer_interval" valor="6h"/>
+<parametro clave="dlq_retencion_dias" valor="90"/>
+<parametro clave="pool_size_P0/P1/P2/P2plus" valor="20+10/10+5/5+3/3+2"/>
+<parametro clave="hpa_min_max" valor="3-10 pods CPU70%"/>
+<parametro clave="k6_threshold_baseline" valor="p95&lt;500ms fail&lt;1%"/>
+<parametro clave="trial_dias" valor="14"/>
+<parametro clave="llm_budget_tokens_mes" valor="200000 por tenant"/>
+</anexo>
+
+<anexo id="D" nombre="Queries SQL canon (muestra crítica)"/>
+<anexo id="E" nombre="Seed canon"/>
+<anexo id="F" nombre="KPIs + microcopy"/>
+<anexo id="G" nombre="Cumplimiento legal MX"/>
+<anexo id="H" nombre="i18n"/>
+<anexo id="I" nombre="Brand quick-ref"/>
+<anexo id="J" nombre="Contrato híbrido checkout"/>
+<anexo id="K" nombre="Deuda técnica (gaps no resueltos con sprint asignado)">
+<deuda sprint="P1-5" prioridad="alta">Implementar Redis DECRBY hot-path para stock &lt; 50 en add-to-cart</deuda>
+<deuda sprint="P1-6" prioridad="alta">Configurar MercadoPago Live + validar HMAC en producción</deuda>
+<deuda sprint="P2-9" prioridad="media">Migrar polling de outbox a Debezium CDC cuando volumen &gt; 1M eventos/día</deuda>
+<deuda sprint="P2-11" prioridad="media">Casbin custom roles (gerente/encargado/almacenista dedicado)</deuda>
+<deuda sprint="P2-12" prioridad="alta">Migrar a Kubernetes (EKS) + Helm + ArgoCD</deuda>
+<deuda sprint="P3-15" prioridad="media">MLService predictivo de stock con estacionalidad</deuda>
+<deuda sprint="P3-16" prioridad="baja">Marketplace UberEats/RappiTurbo como canal de venta</deuda>
+<deuda sprint="P3-16" prioridad="media">GEO/AEO contenido curado automatizado por LLM</deuda>
+</anexo>
+
+<anexo id="L" nombre="Roadmap 16+1 sprints RECORTADO (P0-núcleo + P0.5)">
+<fase id="P0-nucleo" sprints="S1-S3.5" estado="v2.3.1" desc="auth+RLS+seed → catálogo+lotes → POS+sync+FEFO+caja+outbox(nucleo). DEMO VENDIBLE: vender offline, sincronizar idempotente, corte por caja. ~6-8 semanas."/>
+<fase id="P0.5" sprints="S4-S4.5" estado="v2.3.1" desc="aparados + TAE + cotizador impresión + autofactura QR + CFDI PAC sandbox + 9 workers full + Sprint 4.5 calibración"/>
+<fase id="P1" sprints="S5-S8" desc="e-com+SEO+carrito · checkout+MP+webhooks · bot+notification · logística+empaque+citas+Kafka+agentes 1-3"/>
+<fase id="P2" sprints="S9-S12" desc="kiosco+Casbin · campañas+contable · soporte+carga masiva+SaaS · K8s+Vault+App+DLQ Console"/>
+<fase id="P3" sprints="S13-S16" desc="marketplace+ML+GEO/AEO+LATAM"/>
+</anexo>
+
+<anexo id="M" nombre="Glosario de términos de negocio y arquitectura">
+<termino nombre="Aparado">Sistema de apartado con enganche (≥30% del total) y plazo (30 días default). RESERVA stock (cantidad_reservada en lotes), NO descuenta. Al liquidar → hard-allocate FEFO. Al vencer → libera + penalización 10% del saldo (mín $10).</termino>
+<termino nombre="Caja">Entidad de DINERO (cajas_registradoras). Independiente por caja: fondo, ventas, retiros, cierre. NO confundir con "Estación" (terminal).</termino>
+<termino nombre="CFDI">Comprobante Fiscal Digital por Internet (México, SAT 4.0). Timbrado vía PAC (SW Smarter, Facturama, Ecodex, Pocket CFDI).</termino>
+<termino nombre="Corte de caja">SESIÓN DE DINERO de UNA caja. UNIQUE(caja_id) WHERE estado='abierto' → una caja = un corte abierto a la vez. |descuadre| &gt; $50 → estado 'observacion'.</termino>
+<termino nombre="DLQ (Dead Letter Queue)">Cola de eventos que fallaron 3+ veces. Persistidos en tdlq_eventos con historial_intentos JSONB + retención 90 días. Replay manual o automático.</termino>
+<termino nombre="Estación">TERMINAL físico o virtual (POS, WEB, MOVIL, API, KIOSCO, EMPAQUE). Puede tener caja_id nullable (POS → sí; WEB/API → NULL).</termino>
+<termino nombre="FEFO (First Expired, First Out)">Algoritmo de despacho de lotes: primero el que vence antes. Lock artículo PRIMERO + lotes después (evita lost-update). Bloquea filas FOR UPDATE.</termino>
+<termino nombre="Outbox">Patrón transaccional: cada evento se INSERTA en la tabla outbox_eventos DENTRO de la MISMA transacción ACID del agregado. Workers consumen después. NUNCA usar trigger de BD. F17: flags separados (publicado_kafka / procesado_loyalty).</termino>
+<termino nombre="PAC (Proveedor Autorizado de Certificación)">Empresa autorizada por el SAT para timbrar CFDI. PapelMaind usa PAC-FIRST: PAC_PRIMARY → PAC_FALLBACK → DLQ nocturno.</termino>
+<termino nombre="Papelería (en DB)">= Tenant. La entidad `papelerias`. Toda tabla con papeleria_id lleva RLS.</termino>
+<termino nombre="RLS (Row-Level Security)">Seguridad a nivel de fila de PostgreSQL. PapelMaind usa ENABLE + FORCE + política `tenant_isolation_&lt;tabla&gt;` con USING y WITH CHECK.</termino>
+<termino nombre="Tarjeta Consentido">Programa de fidelización. Acumulación 1 peso = 1 punto (P1). Niveles: bronce (0-999) · plata (1k-4,999) · oro (5k-9,999) · platino (10k+). Redención: 100 pts = $5, mínimo 500 pts, tope 50% del ticket.</termino>
+<termino nombre="Tenant">Cliente SaaS de PapelMaind. Cada tenant tiene slug → subdominio. IDs UUID v7. RLS aislado.</termino>
+<termino nombre="TenantUnitOfWork">Context manager async que setea `app.current_tenant_id` con SET LOCAL transaccional. Obligatorio en tráfico autenticado (API con erp_app).</termino>
+<termino nombre="TOCTOU (Time-of-Check to Time-of-Use)">Race condition: entre verificar y actuar, otro proceso cambia el estado. PapelMaind la evita con UNIQUE constraints + ON CONFLICT (idempotencia) en lugar de SELECT previo.</termino>
+<termino nombre="UUID v7">UUID timestamp-ordered (RFC 9562). PapelMaind lo usa en TODO (server + POS client_uuid). Genera: `generate_uuid_v7()` en PostgreSQL.</termino>
+<termino nombre="WorkerSessionLocal">Session factory para los 9 workers, usando `worker_engine` con rol `erp_worker` (BYPASSRLS). OBLIGATORIO — AsyncSessionLocal en un worker devuelve 0 filas por RLS sin contexto tenant.</termino>
+<termino nombre="BYO-LLM (Bring Your Own LLM)">Motor de IA agnóstico que permite conectar o alternar dinámicamente entre diferentes proveedores (Kimi, Qwen, DeepSeek, Claude, OpenAI GPT-4o, modelos locales) mediante API keys o pasarelas.</termino>
+<termino nombre="Handoff Inteligente">Sistema de escalamiento automático que detecta cuándo derivar la conversación a un asesor humano basándose en disparadores (reglas de negocio, sentimiento/frustración, cierre B2B).</termino>
+<termino nombre="CRM Omnicanal Unificado">Panel de gestión centralizada donde confluyen todas las interacciones de los clientes (WhatsApp, Instagram, Facebook Messenger, Telegram, Email, Web Chat) con contexto de tenant/cliente acoplado al RLS.</termino>
+</anexo>
+
+<anexo id="N" nombre="Índice de búsqueda cross-reference">
+<indice>
+<entrada concepto="Autofactura QR"><ubicacion seccion="6" sub="autofactura_qr"/><tabla>tautofacturaciontokens</tabla><endpoint>POST /api/v1/autofactura/token/{venta_id}</endpoint><endpoint>POST /api/v1/autofactura/solicitar</endpoint></entrada>
+<entrada concepto="BYO-LLM Gateway"><ubicacion seccion="5" sub="llm_gateway"/><archivo>backend/src/application/services/llm_gateway.py</archivo></entrada>
+<entrada concepto="Caja vs Estación (FIX B2)"><ubicacion seccion="1" conv="CONV-16"/><ubicacion seccion="3" sub="reglas_caja_estacion"/><tabla>cajas_registradoras</tabla><tabla>estaciones</tabla><tabla>tcortescaja</tabla></entrada>
+<entrada concepto="CFDI global nocturno (FIX B3)"><ubicacion seccion="2" modelo="tfacturascfdi"/><ubicacion seccion="6" sub="flujos/global-nocturno"/><tabla>tfacturascfdi</tabla><worker>cfdi_worker</worker></entrada>
+<entrada concepto="CRM Omnicanal"><ubicacion seccion="5" sub="panel_crm_omnicanal"/><tabla>tconversaciones_omnicanal</tabla><endpoint>GET /api/v1/crm/conversaciones</endpoint></entrada>
+<entrada concepto="DLQ operativa"><ubicacion seccion="8" sub="dlq_operations"/><tabla>tdlq_eventos</tabla><endpoint>GET /api/v1/admin/dlq/eventos</endpoint><endpoint>POST /api/v1/admin/dlq/replay-batch</endpoint><worker>dlq_consumer</worker><worker>dlq_replayer</worker><dashboard>admin.papelmaind.com/dlq</dashboard></entrada>
+<entrada concepto="FEFO allocator"><ubicacion seccion="2" sub="servicios_core/fefo_allocator"/><tabla>tlotes</tabla><tabla>tmovinventario</tabla></entrada>
+<entrada concepto="GEO/AEO"><ubicacion seccion="4" sub="seo_aeo_geo"/><ubicacion seccion="10" anexo="G"/><endpoint>GET /api/v1/geo/guia/{tema}</endpoint><topic>geo.guide.viewed</topic></entrada>
+<entrada concepto="Handoff Inteligente"><ubicacion seccion="5" sub="handoff_inteligente"/><archivo>backend/src/application/services/handoff_service.py</archivo></entrada>
+<entrada concepto="Idempotencia"><ubicacion seccion="1" conv="CONV-13"/><ubicacion seccion="3" sub="flujo_sync"/><patron>UNIQUE + ON CONFLICT DO NOTHING</patron></entrada>
+<entrada concepto="IA Loop (5 agentes)"><ubicacion seccion="5" sub="ia_loop"/><worker>ia_loop_worker</worker><framework>LangGraph</framework></entrada>
+<entrada concepto="MercadoPago"><ubicacion seccion="4" sub="integracion_mercadopago"/><tabla>tpagos</tabla><tabla>twebhookspago</tabla><endpoint>POST /api/v1/ecommerce/checkout</endpoint><endpoint>POST /api/v1/webhooks/payments</endpoint></entrada>
+<entrada concepto="Outbox transaccional"><ubicacion seccion="1" conv="CONV-06"/><ubicacion seccion="2" modelo="outbox_eventos"/><worker>outbox_worker</worker><worker>loyalty_worker</worker></entrada>
+<entrada concepto="Pool sizing dinámico"><ubicacion seccion="2" sub="pool_sizing"/><doc>docs/POOL_SIZING.md</doc></entrada>
+<entrada concepto="Reserva carrito (F20)"><ubicacion seccion="1" conv="CONV-17/excepcion"/><ubicacion seccion="2" sub="servicios_core/cart_service"/><worker>reservation_sweeper</worker><test>T12</test></entrada>
+<entrada concepto="RLS suite"><ubicacion seccion="1" conv="CONV-07"/><ubicacion seccion="2" sub="rls_suite"/><funcion>set_current_tenant(p UUID)</funcion></entrada>
+<entrada concepto="Teclado virtual 3-modos"><ubicacion seccion="3" sub="teclado_virtual"/><componente>frontend/pos/src/components/VirtualKeyboard.tsx</componente><componente>frontend/kiosco/teclado-regen.html</componente></entrada>
+<entrada concepto="UUID v7"><ubicacion seccion="1" conv="CONV-03"/><funcion>generate_uuid_v7()</funcion><pkg_cliente>uuidv7</pkg_cliente></entrada>
+<entrada concepto="Webhook WhatsApp (F19)"><ubicacion seccion="5" sub="webhook_endpoints/paso_3bis"/><funcion>resolve_tenant_context</funcion><test>T11</test></entrada>
+<entrada concepto="Workers y WorkerSessionLocal"><ubicacion seccion="7" sub="workers"/><ubicacion seccion="1" conv="CONV-07"/><regla>RG-04</regla></entrada>
+</indice>
+</anexo>
+
+<anexo id="O" nombre="Mapa de dependencias entre módulos y workers">
+<tabla_dependencias>
+<fila worker="outbox_worker" depende_de="outbox_eventos (WHERE publicado_kafka=false)" emite="kafka topics, dlq.events"/>
+<fila worker="loyalty_worker" depende_de="outbox_eventos (WHERE procesado_loyalty=false), tventas, ttarjetaconsentido, tmovimientospuntos" emite="outbox_eventos (F4)"/>
+<fila worker="cfdi_worker" depende_de="tfacturascfdi" emite="PAC calls, error_dlq"/>
+<fila worker="inventory_alert_worker" depende_de="tarticulos, vw_stock_sucursal, talertasreposicion" emite="outbox_eventos (F6)"/>
+<fila worker="notification_worker" depende_de="Kafka topics (notifications.*)" emite="Meta Cloud API, tmensajes"/>
+<fila worker="ia_loop_worker" depende_de="5 topics Kafka + LLMGateway" emite="outbox_eventos (indirecto)"/>
+<fila worker="reservation_sweeper" depende_de="tcarritoitems, tarticulos, tcarritos" emite="liberaciones a nivel ARTÍCULO (F20)"/>
+<fila worker="ai_campaign_worker" depende_de="tsegmentosclientes, tiainteraccionesvector, tcampanas" emite="tcampanas programadas"/>
+<fila worker="dlq_consumer" depende_de="dlq.events topic" emite="tdlq_eventos"/>
+</tabla_dependencias>
+</anexo>
+
+<anexo id="P" nombre="Plan de Disaster Recovery (DR)">
+<objetivos>
+<objetivo nombre="RTO (Recovery Time Objective)" valor="30 minutos"/>
+<objetivo nombre="RPO (Recovery Point Objective)" valor="5 minutos"/>
+<objetivo nombre="MTTR (Mean Time To Recover)" valor="15 minutos (incidentes menores)"/>
+</objetivos>
+<escenarios>
+<escenario id="DR-1" nombre="Fallo de PostgreSQL"><impacto>Todo el sistema detenido</impacto><rto>15 min</rto><rpo>5 min (WAL archiving P1) / 24h (pg_dump P0)</rpo></escenario>
+<escenario id="DR-2" nombre="Corrupción de datos (Ransomware)"><rto>4 horas</rto><rpo>24 horas (último backup limpio)</rpo></escenario>
+<escenario id="DR-3" nombre="Fallo de Kafka"><impacto>outbox_worker no publica; loyalty_worker SÍ sigue en P0 (flags separados F17)</impacto><rto>10 min</rto><rpo>0 (outbox preserva todo)</rpo></escenario>
+<escenario id="DR-4" nombre="Fallo de PAC"><rto>6 horas (dlq_replayer nocturno)</rto><rpo>0</rpo></escenario>
+<escenario id="DR-5" nombre="Región completa caída (AWS)"><rto>2 horas</rto><rpo>5 min (cross-region P2+)</rpo></escenario>
+</escenarios>
+<backup_strategy>
+<capa n="1" nombre="pg_dump diario">retención 30 días · comprimido gzip · a S3</capa>
+<capa n="2" nombre="WAL archiving P1">streaming continuo · permite PITR</capa>
+<capa n="3" nombre="S3 versionado">XML CFDI + PDFs + logos · retención fiscal 5+ años</capa>
+<capa n="4" nombre="Redis RDB cada 15min">cache only — reproducible desde DB</capa>
+<capa n="5" nombre="Cross-region replica P2+">RDS Multi-AZ + read replica</capa>
+</backup_strategy>
+</anexo>
+
+<anexo id="Q" nombre="Plan de Capacity Planning por escala">
+<escalas>
+<escala tenants="1-10" nombre="Startup"><recursos><recurso nombre="VPS" valor="4 vCPU · 8 GB RAM · 100 GB SSD"/></recursos><pool_sizing>P0: pool_size=20 max_overflow=10</pool_sizing><costo_estimado_usd_mes>80</costo_estimado_usd_mes></escala>
+<escala tenants="10-100" nombre="Crecimiento"><pool_sizing>P1: pool_size=10 max_overflow=5</pool_sizing><costo_estimado_usd_mes>350</costo_estimado_usd_mes></escala>
+<escala tenants="100-1000" nombre="Escala media (K8s)"><pool_sizing>P2: pool_size=5 max_overflow=3 + PgBouncer</pool_sizing><costo_estimado_usd_mes>3500</costo_estimado_usd_mes></escala>
+<escala tenants="1000-10000" nombre="Enterprise (multi-region)"><pool_sizing>P2+: pool_size=3 max_overflow=2 + PgBouncer</pool_sizing><costo_estimado_usd_mes>25000+</costo_estimado_usd_mes></escala>
+</escalas>
+</anexo>
+
+<anexo id="R" nombre="Checklist de Security Hardening">
+<owasp_top10_2021>
+<item id="A01" nombre="Broken Access Control" estado="mitigado"><mitigacion>RLS FORCE + WITH CHECK en 120 tablas. Casbin P2. tauditlogs para cross-tenant superadmin. F19 webhook tenant isolation.</mitigacion></item>
+<item id="A02" nombre="Cryptographic Failures" estado="mitigado"><mitigacion>Fernet para CSD/tokens/api_keys · bcrypt cost 12 · TLS 1.3 · Vault AppRole KV-v2.</mitigacion></item>
+<item id="A03" nombre="Injection" estado="mitigado"><mitigacion>SQLAlchemy parametrizado · Pydantic validation · ruff bandit.</mitigacion></item>
+<item id="A04" nombre="Insecure Design" estado="mitigado"><mitigacion>Clean Architecture · idempotencia UNIQUE+ON CONFLICT · circuit breakers.</mitigacion></item>
+<item id="A05" nombre="Security Misconfiguration" estado="mitigado"><mitigacion>docker non-root · Vault · CSP + CORS restrictivo.</mitigacion></item>
+<item id="A06" nombre="Vulnerable and Outdated Components" estado="mitigado"><mitigacion>Trivy scan en CI · Dependabot · Cosign.</mitigacion></item>
+<item id="A07" nombre="Identification and Authentication Failures" estado="mitigado"><mitigacion>JWT + refresh rotación · TOTP 2FA · OTP WhatsApp · rate limit 30/min.</mitigacion></item>
+<item id="A08" nombre="Software and Data Integrity Failures" estado="mitigado"><mitigacion>Outbox transaccional · Cosign · S3 versioning · audit logs.</mitigacion></item>
+<item id="A09" nombre="Security Logging and Monitoring Failures" estado="mitigado"><mitigacion>structlog JSON · OpenTelemetry · Prometheus 24 métricas · 15 alertas · Loki.</mitigacion></item>
+<item id="A10" nombre="Server-Side Request Forgery (SSRF)" estado="mitigado"><mitigacion>Whitelist de dominios externos · timeout httpx · NO fetch URLs de usuario.</mitigacion></item>
+</owasp_top10_2021>
+<cis_benchmarks>
+<item nombre="Docker CIS" estado="aplicado"><regla>Non-root user (UID 1001)</regla><regla>Read-only root filesystem</regla><regla>No privileged containers</regla><regla>Image scanning (Trivy)</regla><regla>HEALTHCHECK en cada servicio</regla></item>
+<item nombre="Kubernetes CIS (P2+)" estado="aplicado"><regla>NetworkPolicies default-deny</regla><regla>PodSecurityPolicy restricted</regla><regla>Secret encryption at rest</regla><regla>RBAC least-privilege</regla><regla>No hostPID/hostNetwork</regla></item>
+<item nombre="PostgreSQL CIS" estado="aplicado"><regla>SCRAM-SHA-256 auth</regla><regla>SSL required for remote connections</regla><regla>pg_audit extension (P2+)</regla><regla>Backup encryption en reposo</regla></item>
+</cis_benchmarks>
+<secrets_management>
+<regla>NUNCA secrets en código fuente</regla>
+<regla>NUNCA PIN/password/token en plaintext en DB</regla>
+<regla>Vault AppRole KV-v2 en P2+</regla>
+<regla>Rotación trimestral de: JWT_SECRET, PAC credentials, WhatsApp tokens, DB passwords</regla>
+<regla>Rotación anual de CSD (.cer + .key)</regla>
+</secrets_management>
+<network_security>
+<regla>TLS 1.3 mínimo en tránsito</regla>
+<regla>HSTS con preload</regla>
+<regla>CSP estricto (sin unsafe-inline en prod; F27 kiosco sin unsafe-eval)</regla>
+<regla>CORS whitelist por tenant</regla>
+<regla>Rate limiting en endpoints públicos (4 endpoints)</regla>
+<regla>WAF en Cloudflare (P2+)</regla>
+</network_security>
+<pii_lfpdppp>
+<regla>Aviso de privacidad en checkout + WhatsApp</regla>
+<regla>ARCO (Acceso, Rectificación, Cancelación, Oposición) endpoints</regla>
+<regla>PII masking wa_id → SHA-256 ANTES de LLM</regla>
+<regla>visitorHash en GEO analytics = SHA-256(IP+UA+salt diaria)</regla>
+<regla>NO guardar IP cruda en logs</regla>
+<regla>Retención fiscal CFDI 5+ años</regla>
+</pii_lfpdppp>
+<audit_trail>
+<tabla>tauditlogs</tabla>
+<acciones_auditadas>INSERT, UPDATE, DELETE · ACCESO_SUPERADMIN · PRECIO_OVERRIDE · UI_EVENT · PREDICCION · DLQ_MANUAL_ACTION · DLQ_DISCARD</acciones_auditadas>
+<regla>Inmutable — sin UPDATE/DELETE grants</regla>
+<retencion>2 años default · 5 años para acciones contables</retencion>
+</audit_trail>
+</anexo>
+
+<!-- ============ ANEXO S (F22): MAPEO DE ENUMS DB ↔ EVENTOS ============ -->
+<anexo id="S" nombre="Mapeo de enums DB ↔ eventos Kafka (F22)">
+<descripcion>
+F22: canoniza el mapeo entre enums DB y JSON Schemas de eventos. El lint (CHK-L4) valida
+que no queden valores de evento fuera de DB sin regla de expansión documentada.
+</descripcion>
+<tabla nombre="metodo_pago">
+<fila db="efectivo" evento="efectivo" regla="directo"/>
+<fila db="tarjeta" evento="tarjeta_debito|tarjeta_credito" regla="expandir según tpagosventa.referencia/detalle BIN (web) o dato capturado (POS)"/>
+<fila db="transferencia" evento="transferencia|spei" regla="spei si pasarela=SPEI"/>
+<fila db="mixto" evento="mixto" regla="directo; el desglose vive en tpagosventa/tpagos"/>
+<fila db="credito" evento="credito" regla="directo"/>
+<fila db="puntos" evento="puntos" regla="directo"/>
+<fila db="(web solamente)" evento="mercado_pago|openpay" regla="SOLO eventos web: la venta DB guarda el método base, la pasarela granular vive en tpagos.metodo_pago_tipo y se expande al emitir el evento"/>
+</tabla>
+<tabla nombre="estaciones.tipo (excepción CONV-04)">
+<fila db="POS" evento="pos" regla="F26: MAYÚSCULAS en DB (identificador de terminal), minúsculas en eventos"/>
+<fila db="WEB" evento="web" regla="idem"/>
+<fila db="MOVIL" evento="movil" regla="idem"/>
+<fila db="API" evento="api" regla="idem"/>
+<fila db="KIOSCO" evento="kiosco" regla="idem"/>
+<fila db="EMPAQUE" evento="empaque" regla="idem"/>
+</tabla>
+<regla_general>
+Los JSON Schemas de eventos pueden tener MÁS valores que la DB SOLO si el mapeo está
+documentado en este Anexo S. El lint CHK-L4 detecta valores de evento sin mapeo
+y bloquea el merge.
+</regla_general>
+</anexo>
+
+<!-- ============ ANEXO T (F28): PROCESO DE ENMIENDAS RFC-LITE ============ -->
+<anexo id="T" nombre="Proceso de enmiendas RFC-lite (F28)">
+<descripcion>
+F28: todo fix NUEVO entra como RFC-lite. PROHIBIDO editar el Anexo B a mano.
+El Anexo B queda CONGELADO como histórico. Los fixes se registran aquí y el
+canon v2.3.1 se regenera con el lint.
+</descripcion>
+<ciclo>
+<paso n="1">Propuesta: el fix se propone como `<enmienda id="RFC-NNN" fix="FXX" motivo="..." secciones="..." estado="propuesta"/>`.</paso>
+<paso n="2">Aplicar fix al CUERPO del canon → correr `scripts/canon_lint.py` (CI gate obligatorio).</paso>
+<paso n="3">Lint verde → estado="aceptada". El contador vivo = len(enmiendas aceptadas).</paso>
+</ciclo>
+<numeracion>F1-F16 histórico v2.1.x · F17-F28 v2.2.1 · F29-F38 v2.3.0 · F39+ solo vía RFC-lite</numeracion>
+<enmiendas_aceptadas>
+<enmienda id="RFC-017" fix="F17" motivo="Loyalty muerto en P0 (flags outbox sobrecargados)" secciones="2,7" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-018" fix="F18" motivo="talertasreposicion eliminada pero worker la usa" secciones="2,7" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-019" fix="F19" motivo="Webhook WhatsApp sin set_current_tenant (cross-tenant)" secciones="5" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-020" fix="F20" motivo="Sweeper violaba CONV-17 + trigger no testeable" secciones="1,2,3,4" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-021" fix="F21" motivo="alert()/console en código canon (viola RG-02)" secciones="3" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-022" fix="F22" motivo="Enums DB vs eventos divergentes (7 vs 10)" secciones="10" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-023" fix="F23" motivo="docker-compose sin workers ni frontends (ancla huérfana)" secciones="9" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-024" fix="F24" motivo="catalogo_claves_config eliminada + TZ hardcode en agente citas" secciones="2,5" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-025" fix="F25" motivo="CFDI TasaOCuota hardcode (rompe IEPS/exento)" secciones="6" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-026" fix="F26" motivo="Menores: estaciones.tipo, conteo métricas, workers 11-12, docs" secciones="1,7,8,11" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-027" fix="F27" motivo="Kiosco dev usa Babel runtime + unsafe-eval (CSP amplia)" secciones="9" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-028" fix="F28" motivo="Formalizar proceso de enmiendas (evita conteos manuales rotos)" secciones="10" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-029" fix="F29" motivo="DLQ replay reseteaba `publicado_kafka=false` (no `procesado`)" secciones="7,8" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-030" fix="F30" motivo="FEFOAllocator no decrementaba `stock_reservado` al liquidar" secciones="2" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-031" fix="F31" motivo="`tarticulos` no tenía campo `stock_minimo`" secciones="2" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-032" fix="F32" motivo="`loyalty_worker` usaba `ANY(:ids)` sin CAST para asyncpg" secciones="7" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-033" fix="F33" motivo="CFDI `ObjetoImp` siempre '02' incluso para exentos" secciones="6" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-034" fix="F34" motivo="`notification_worker` unificado (9 workers totales, email/push son colas internas)" secciones="7" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-035" fix="F35" motivo="CFDI corregido: `&lt;` reales en CDATA (no `&lt;` escapados)" secciones="6" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-036" fix="F36" motivo="Token WhatsApp por tenant desde `papeleria_api_keys`" secciones="5,7" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-037" fix="F37" motivo="UNIQUE parcial en `whatsapp_phone_number_id`" secciones="5" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-038" fix="F38" motivo="Helpers canonizados (`getNextFolio`, `get_config_value`, `sweep_reservations_once`)" secciones="3,5,7" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-039" fix="R1" motivo="Métricas: 24 reales (añadir 4 faltantes)" secciones="8" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-040" fix="R2" motivo="Árbol completo: restaurar `backend/migrations/` (001-015) + `scripts/canon_lint.py`" secciones="11" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-041" fix="R3" motivo="LLM Gateway presupuesto: restaurar `session.add(TLLMBudgetLog(...))` en `generate()`" secciones="5" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-042" fix="R4" motivo="CHK-39 restaurado (incluye checks F17/F19/F20/F21/F27)" secciones="12" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-043" fix="R5" motivo="CRM Omnicanal: añadir tabla `tconversaciones_omnicanal`" secciones="2,5" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-044" fix="R6" motivo="Autocontenido: restaurar secciones 3,4,6,7,9,10 completas" secciones="*" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-045" fix="R7" motivo="Rebrand completo: `PapelMaind` + nota legal IMPI actualizada" secciones="1" estado="aceptada" fecha="2026"/>
+<enmienda id="RFC-046" fix="R8" motivo="Linaje correcto: `predecesor='2.2.1'` (no saltar v2.2.2)" secciones="cierre" estado="aceptada" fecha="2026"/>
+</enmiendas_aceptadas>
+</anexo>
+</anexos>
+
+<!-- ============ REGLAS DE GENERACIÓN (RG-01 a RG-18) ============ -->
+<reglas_generacion>
+<regla id="RG-01">Stack EXACTO sin sustituciones: FastAPI+SQLModel async · React+Vite POS · Next.js App Router web · Vite checkout SPA. NO NestJS, NO backend Node, NO Electron.</regla>
+<regla id="RG-02">PROHIBIDO: float en dinero · int en cantidades · UUID v4 · alert/prompt/confirm · console.log en prod · emojis en títulos/botones UI · secrets hardcodeados · PIN/contraseña/token plaintext · crear tablas futuras al generar fase actual (stub TODO(fase)).</regla>
+<regla id="RG-03">SIEMPRE: TenantUnitOfWork (SET LOCAL) tráfico autenticado · WorkerSessionLocal (BYPASSRLS) SOLO 9 workers + 4 endpoints públicos con tenant explícito + audit · outbox mismo commit · client_uuid offline · RLS FORCE+WITH CHECK por tabla · folio UNIQUE(papeleria,sucursal,folio) · eventos inglés · __tablename__ minúsculas · Pydantic Decimal(gt=0,max_digits,decimal_places) · excepciones de dominio traducidas en capa API · finally: métricas.observe().</regla>
+<regla id="RG-04">WORKERS: WorkerSessionLocal OBLIGATORIO (erp_worker). AsyncSessionLocal en worker = bug F1 (RLS devuelve 0 filas). Test T10 valida la regresión.</regla>
+<regla id="RG-05">Contratos endpoint críticos: /pos/ventas/sync → 201 created | 200 duplicated | 409 stock · webhooks → HMAC + UNIQUE(pasarela,id_externo) ON CONFLICT DO NOTHING · autofactura → token_hash digest() tiempo-constante · /inventory/stock → disponible=actual−reservado · /admin/dlq/replay-batch → límite 1000 + confirm=true (F8).</regla>
+<regla id="RG-06">UI: 3 paletas por contexto (CONV-10) sin mezclar · táctil ≥38px · WCAG AA · strings es-MX vía claves i18n · loading/disabled/aria-busy en toda acción async · toasts con tipos · teclado virtual 3-modos en POS/Kiosco.</regla>
+<regla id="RG-07">Antes de 'completado': T1-T12 verdes 3 corridas + smoke + seed verificación + (si módulo con carga) k6 escenario aplicable.</regla>
+<regla id="RG-08">Naming: español tablas/columnas, inglés código/eventos/topics (CONV-01/02). Estados minúsculas (CONV-04, excepción estaciones.tipo documentada).</regla>
+<regla id="RG-09">DLQ: todo fallo de procesamiento incrementa intentos; ≥3 = TERMINAL + fila tdlq_eventos vía dlq_consumer + métrica + posible alerta. Replay SIEMPRE acotado (individual libre, batch ≤1000 confirm=true).</regla>
+<regla id="RG-10">Pool sizing por fase (sección 2) — NUNCA pool 20+10 en P2+ multi-pod. Con PgBouncer: transaction mode.</regla>
+<regla id="RG-11">Fiscal: timbrado SIEMPRE asíncrono (worker) — la caja/web NUNCA espera al PAC. Impuestos por LÍNEA (timpuestos), no tasa global. F25: TotalImpuestosTrasladados se AGREGA desde líneas.</regla>
+<regla id="RG-12">Caja: tcortescaja.caja_id NOT NULL + UNIQUE abierto por caja. Venta POS requiere corte abierto de SU caja (offline: resolver al sync; corte cerrado → conflicto corte_cerrado).</regla>
+<regla id="RG-13">Estacionalidad: alertas y HPA se calculan sobre multiplicadores del Anexo C; pools sobre baseline (el HPA escala pods, no el pool).</regla>
+<regla id="RG-14">Toda decisión de ESTE documento es CANON: si código de referencia contradice este XML, GANA este XML (conflictos ya resueltos C1-C10 + Anexo B 84 fixes + F17-F38 v2.3.1).</regla>
+<regla id="RG-15">Sprint 4.5 obligatorio antes de primer pilot: k6 ×5 verdes + DLQ drill + alertas validadas + backup drill + acta firmada que actualiza este XML.</regla>
+<regla id="RG-16" fix="F19">WEBHOOK WHATSAPP: resolve_tenant_by_phone(phone_number_id) → set_current_tenant ANTES de CUALQUIER escritura. Verificado por test T11.</regla>
+<regla id="RG-17" fix="F20">RESERVA CARRITO: por APLICACIÓN (cart_service.reservar_stock con SELECT FOR UPDATE), NO trigger. Sweeper libera al MISMO nivel (artículo). Verificado por test T12.</regla>
+<regla id="RG-18" fix="F28">ENMIENDAS: cualquier fix nuevo al canon entra vía RFC-lite (Anexo T). PROHIBIDO editar Anexo B a mano. Lint en CI obligatorio.</regla>
+</reglas_generacion>
+</seccion_10_anexos_reglas>
+
+<!-- ============================================================================ -->
+<!-- SECCIÓN 11: ESTRUCTURA DE REPOSITORIO GITHUB (R2: árbol completo)            -->
+<!-- ============================================================================ -->
+<seccion_11_estructura_repositorio fase="Transversal" obligatorio="true">
+<descripcion>
+Esta es la estructura EXACTA que la IA debe generar. Ninguna carpeta puede
+omitirse en P0, aunque esté vacía (con .gitkeep). Todas las rutas son
+relativas a la raíz del repositorio `papelmaind/`.
+</descripcion>
+<raiz_archivos>
+<archivo path="README.md" desc="Documentación principal"/>
+<archivo path="LICENSE" desc="MIT o propietaria"/>
+<archivo path=".gitignore" desc="Python, Node, .env, .venv, __pycache__, node_modules, dist, .next, coverage"/>
+<archivo path=".env.example" desc="TODAS las variables documentadas"/>
+<archivo path=".pre-commit-config.yaml" desc="ruff, mypy, bandit, prettier, eslint"/>
+<archivo path=".editorconfig"/>
+<archivo path="Makefile" desc="dev, build, test, migrate, seed, lint, format, backup, deploy, canon-lint"/>
+<archivo path="docker-compose.yml"/>
+<archivo path="docker-compose.prod.yml"/>
+<archivo path="pyproject.toml" desc="Config global monorepo"/>
+<archivo path="CHANGELOG.md"/>
+<archivo path="CONTRIBUTING.md"/>
+<archivo path=".github/workflows/ci.yml"/>
+<archivo path=".github/workflows/cd.yml"/>
+<archivo path=".github/workflows/canon-lint.yml" desc="F28: lint del canon en cada PR"/>
+<archivo path=".github/PULL_REQUEST_TEMPLATE.md"/>
+<archivo path=".github/ISSUE_TEMPLATE/bug_report.md"/>
+<archivo path=".github/ISSUE_TEMPLATE/feature_request.md"/>
+</raiz_archivos>
+
+<carpeta_scripts>
+<archivo path="scripts/canon_lint.py" desc="F28: valida el XML canon contra sí mismo (CI gate)"/>
+<archivo path="scripts/deploy.sh"/>
+<archivo path="scripts/backup.sh"/>
+<archivo path="scripts/restore.sh"/>
+<archivo path="scripts/smoke_test.sh"/>
+<archivo path="scripts/dlq_drill.sh"/>
+<archivo path="scripts/backup_restore_drill.sh"/>
+<archivo path="scripts/run_k6_all.sh"/>
+<archivo path="scripts/close_v1.0.0.sh"/>
+</carpeta_scripts>
+
+<carpeta_backend>
+<archivo path="backend/Dockerfile"/>
+<archivo path="backend/Dockerfile.dev"/>
+<archivo path="backend/requirements.txt"/>
+<archivo path="backend/requirements-dev.txt"/>
+<archivo path="backend/pyproject.toml"/>
+<archivo path="backend/alembic.ini"/>
+<archivo path="backend/src/main.py" desc="Entrypoint FastAPI"/>
+<archivo path="backend/src/core/config.py"/>
+<archivo path="backend/src/core/logging.py"/>
+<archivo path="backend/src/core/exceptions.py"/>
+<archivo path="backend/src/core/security.py"/>
+<archivo path="backend/src/core/tracing.py"/>
+<archivo path="backend/src/core/metrics.py" desc="24 métricas Prometheus (R1 corregido)"/>
+<archivo path="backend/src/core/vault.py"/>
+<archivo path="backend/src/api/dependencies/auth.py"/>
+<archivo path="backend/src/api/dependencies/tenant.py"/>
+<archivo path="backend/src/api/dependencies/permissions.py"/>
+<archivo path="backend/src/api/middlewares/error_handler.py"/>
+<archivo path="backend/src/api/middlewares/trace.py"/>
+<archivo path="backend/src/api/v1/router.py"/>
+<archivo path="backend/src/api/v1/health.py"/>
+<archivo path="backend/src/api/v1/auth.py"/>
+<archivo path="backend/src/api/v1/tenants.py"/>
+<archivo path="backend/src/api/v1/catalog.py"/>
+<archivo path="backend/src/api/v1/inventory.py"/>
+<archivo path="backend/src/api/v1/pos.py"/>
+<archivo path="backend/src/api/v1/cash.py"/>
+<archivo path="backend/src/api/v1/aparados.py"/>
+<archivo path="backend/src/api/v1/ecommerce.py"/>
+<archivo path="backend/src/api/v1/webhooks.py"/>
+<archivo path="backend/src/api/v1/autofactura.py"/>
+<archivo path="backend/src/api/v1/whatsapp.py" desc="F19: incluye resolve_tenant_context()"/>
+<archivo path="backend/src/api/v1/shipping.py"/>
+<archivo path="backend/src/api/v1/kiosco.py"/>
+<archivo path="backend/src/api/v1/campanas.py"/>
+<archivo path="backend/src/api/v1/contabilidad.py"/>
+<archivo path="backend/src/api/v1/soporte.py"/>
+<archivo path="backend/src/api/v1/carga_masiva.py"/>
+<archivo path="backend/src/api/v1/comisiones.py"/>
+<archivo path="backend/src/api/v1/admin_dlq.py" desc="6 endpoints admin DLQ"/>
+<archivo path="backend/src/api/v1/crm.py" desc="R5: Panel CRM Omnicanal Unificado"/>
+<archivo path="backend/src/api/v1/geo.py"/>
+<archivo path="backend/src/api/v1/servicios_impresion.py"/>
+<archivo path="backend/src/api/v1/metricas.py"/>
+<archivo path="backend/src/application/services/fefo_allocator.py"/>
+<archivo path="backend/src/application/services/outbox_service.py" desc="F17: enqueue con flags separados"/>
+<archivo path="backend/src/application/services/cart_service.py" desc="F20: reservar_stock() por aplicación"/>
+<archivo path="backend/src/application/services/auth_service.py"/>
+<archivo path="backend/src/application/services/tenant_service.py"/>
+<archivo path="backend/src/application/services/cfdi_service.py" desc="F25+F35: totales desde líneas + XML válido"/>
+<archivo path="backend/src/application/services/dlq_service.py"/>
+<archivo path="backend/src/application/services/llm_gateway.py" desc="R3: Motor BYO-LLM con TLLMBudgetLog"/>
+<archivo path="backend/src/application/services/rag_service.py"/>
+<archivo path="backend/src/application/services/conversation_service.py"/>
+<archivo path="backend/src/application/services/whatsapp_service.py"/>
+<archivo path="backend/src/application/services/handoff_service.py" desc="NUEVO v2.3.1: Escalamiento Inteligente"/>
+<archivo path="backend/src/application/services/checkout_service.py"/>
+<archivo path="backend/src/application/services/webhook_service.py"/>
+<archivo path="backend/src/application/services/reserva_service.py"/>
+<archivo path="backend/src/application/services/courier_hub.py"/>
+<archivo path="backend/src/application/services/zona_envio_service.py"/>
+<archivo path="backend/src/application/services/empaque_service.py"/>
+<archivo path="backend/src/application/services/kiosco_service.py"/>
+<archivo path="backend/src/application/services/campana_service.py"/>
+<archivo path="backend/src/application/services/contabilidad_service.py"/>
+<archivo path="backend/src/application/services/reporte_service.py"/>
+<archivo path="backend/src/application/services/soporte_service.py"/>
+<archivo path="backend/src/application/services/carga_masiva_service.py"/>
+<archivo path="backend/src/application/services/comision_service.py"/>
+<archivo path="backend/src/application/services/email_service.py"/>
+<archivo path="backend/src/application/ia_loop/langgraph_orchestrator.py"/>
+<archivo path="backend/src/application/ia_loop/state.py"/>
+<archivo path="backend/src/application/ia_loop/router.py"/>
+<archivo path="backend/src/application/ia_loop/agents/concierge.py"/>
+<archivo path="backend/src/application/ia_loop/agents/ventas_citas.py" desc="F24: usa get_config_value('zona_horaria')"/>
+<archivo path="backend/src/application/ia_loop/agents/supply_chain.py"/>
+<archivo path="backend/src/application/ia_loop/agents/marketing.py"/>
+<archivo path="backend/src/application/ia_loop/agents/systems_integrator.py"/>
+<archivo path="backend/src/infrastructure/db/session.py" desc="api_engine + worker_engine DUALES"/>
+<archivo path="backend/src/infrastructure/db/unit_of_work.py" desc="TenantUnitOfWork"/>
+<archivo path="backend/src/infrastructure/db/base.py"/>
+<archivo path="backend/src/infrastructure/db/models/__init__.py" desc="120 modelos (F18 + R5)"/>
+<archivo path="backend/src/infrastructure/db/models/tenant.py"/>
+<archivo path="backend/src/infrastructure/db/models/usuario.py"/>
+<archivo path="backend/src/infrastructure/db/models/operario.py"/>
+<archivo path="backend/src/infrastructure/db/models/articulo.py"/>
+<archivo path="backend/src/infrastructure/db/models/lote.py"/>
+<archivo path="backend/src/infrastructure/db/models/venta.py"/>
+<archivo path="backend/src/infrastructure/db/models/caja.py"/>
+<archivo path="backend/src/infrastructure/db/models/aparado.py"/>
+<archivo path="backend/src/infrastructure/db/models/tae.py"/>
+<archivo path="backend/src/infrastructure/db/models/fiscal.py"/>
+<archivo path="backend/src/infrastructure/db/models/outbox.py" desc="F17: publicado_kafka + procesado_loyalty"/>
+<archivo path="backend/src/infrastructure/db/models/dlq.py"/>
+<archivo path="backend/src/infrastructure/db/models/carrito.py"/>
+<archivo path="backend/src/infrastructure/db/models/pago.py"/>
+<archivo path="backend/src/infrastructure/db/models/ia.py"/>
+<archivo path="backend/src/infrastructure/db/models/conversacion.py"/>
+<archivo path="backend/src/infrastructure/db/models/conversacion_omnicanal.py" desc="R5: CRM Omnicanal"/>
+<archivo path="backend/src/infrastructure/db/models/envio.py"/>
+<archivo path="backend/src/infrastructure/db/models/courier.py"/>
+<archivo path="backend/src/infrastructure/db/models/kiosco.py"/>
+<archivo path="backend/src/infrastructure/db/models/campana.py"/>
+<archivo path="backend/src/infrastructure/db/models/contabilidad.py"/>
+<archivo path="backend/src/infrastructure/db/models/soporte.py"/>
+<archivo path="backend/src/infrastructure/db/models/rrhh.py"/>
+<archivo path="backend/src/infrastructure/db/models/comunicacion.py"/>
+<archivo path="backend/src/infrastructure/db/models/alerta.py" desc="F18: talertasrestock + talertasreposicion"/>
+<archivo path="backend/src/infrastructure/redis/client.py"/>
+<archivo path="backend/src/infrastructure/kafka/producer.py"/>
+<archivo path="backend/src/infrastructure/kafka/consumer.py"/>
+<archivo path="backend/src/infrastructure/kafka/schema_validator.py"/>
+<archivo path="backend/src/infrastructure/kafka/topics.py" desc="EVENT_TOPIC_MAP"/>
+<archivo path="backend/src/infrastructure/external/pac_primary.py"/>
+<archivo path="backend/src/infrastructure/external/pac_fallback.py"/>
+<archivo path="backend/src/infrastructure/external/whatsapp_client.py"/>
+<archivo path="backend/src/infrastructure/external/mercadopago_client.py"/>
+<archivo path="backend/src/infrastructure/external/llm_providers.py" desc="NUEVO v2.3.1: Kimi, Qwen, DeepSeek, Claude, OpenAI, Local"/>
+<archivo path="backend/src/infrastructure/external/uber_direct_client.py"/>
+<archivo path="backend/src/infrastructure/external/didi_client.py"/>
+<archivo path="backend/src/infrastructure/external/indriver_client.py"/>
+<archivo path="backend/src/infrastructure/external/mototaxi_client.py"/>
+<archivo path="backend/src/infrastructure/auth/casbin_enforcer.py"/>
+<archivo path="backend/src/infrastructure/auth/policies.conf"/>
+<archivo path="backend/src/infrastructure/workers/outbox_worker.py" desc="F17: P0-aware"/>
+<archivo path="backend/src/infrastructure/workers/loyalty_worker.py" desc="F17: procesado_loyalty"/>
+<archivo path="backend/src/infrastructure/workers/cfdi_worker.py"/>
+<archivo path="backend/src/infrastructure/workers/inventory_alert_worker.py" desc="F18: usa talertasreposicion"/>
+<archivo path="backend/src/infrastructure/workers/notification_worker.py" desc="F26+F36: token por tenant"/>
+<archivo path="backend/src/infrastructure/workers/notification_worker/email_queue.py" desc="F26: cola interna (NO worker separado)"/>
+<archivo path="backend/src/infrastructure/workers/notification_worker/push_queue.py" desc="F26: cola interna (NO worker separado)"/>
+<archivo path="backend/src/infrastructure/workers/ia_loop_worker.py"/>
+<archivo path="backend/src/infrastructure/workers/reservation_sweeper.py" desc="F20+F38: sweep_reservations_once canonizado"/>
+<archivo path="backend/src/infrastructure/workers/ai_campaign_worker.py"/>
+<archivo path="backend/src/infrastructure/workers/dlq_consumer.py" desc="F26: usa settings.KAFKA_BOOTSTRAP_SERVERS"/>
+<archivo path="backend/src/infrastructure/workers/dlq_replayer.py"/>
+<archivo path="backend/src/schemas/auth.py"/>
+<archivo path="backend/src/schemas/venta.py"/>
+<archivo path="backend/src/schemas/carrito.py"/>
+<archivo path="backend/src/schemas/checkout.py"/>
+<archivo path="backend/src/schemas/whatsapp.py"/>
+<archivo path="backend/src/schemas/kiosco.py"/>
+<archivo path="backend/src/schemas/campana.py"/>
+<archivo path="backend/src/schemas/contabilidad.py"/>
+<archivo path="backend/src/schemas/soporte.py"/>
+<archivo path="backend/src/schemas/carga_masiva.py"/>
+<archivo path="backend/src/schemas/comision.py"/>
+<archivo path="backend/src/schemas/dlq.py"/>
+<archivo path="backend/src/schemas/crm.py" desc="R5: CRM Omnicanal DTOs"/>
+<archivo path="backend/src/contracts/events/sales.order.completed.json"/>
+<archivo path="backend/src/contracts/events/inventory.stock.changed.json"/>
+<archivo path="backend/src/contracts/events/fiscal.cfdi.requested.json"/>
+<archivo path="backend/src/contracts/events/crm.loyalty.points.moved.json"/>
+<archivo path="backend/src/contracts/events/notifications.whatsapp.send.json"/>
+<archivo path="backend/src/contracts/events/logistics.shipment.updated.json"/>
+<archivo path="backend/src/contracts/events/payments.webhook.processed.json"/>
+<archivo path="backend/src/contracts/events/whatsapp.inbound.received.json"/>
+<archivo path="backend/src/contracts/events/layaway.payment.recorded.json"/>
+<archivo path="backend/src/contracts/events/appointments.confirmed.json"/>
+<archivo path="backend/src/contracts/events/tenant.created.json"/>
+<archivo path="backend/src/contracts/events/notifications.email.send.json"/>
+<archivo path="backend/src/contracts/events/inventory.transfer.completed.json"/>
+<archivo path="backend/src/contracts/events/kiosk.session.completed.json"/>
+<archivo path="backend/src/contracts/events/tae.transaction.completed.json"/>
+<archivo path="backend/src/contracts/events/printing.order.completed.json"/>
+<archivo path="backend/src/contracts/events/geo.guide.viewed.json"/>
+<archivo path="backend/src/contracts/events/analytics.ui.correlated.json"/>
+<archivo path="backend/migrations/env.py"/>
+<archivo path="backend/migrations/script.py.mako"/>
+<archivo path="backend/migrations/versions/001_p0_identity.py"/>
+<archivo path="backend/migrations/versions/002_p0_cat_inv.py"/>
+<archivo path="backend/migrations/versions/003_p0_ventas_caja.py"/>
+<archivo path="backend/migrations/versions/004_p0_aparados_tae_fiscal.py"/>
+<archivo path="backend/migrations/versions/005_p1_carrito.py"/>
+<archivo path="backend/migrations/versions/006_p1_pagos_webhooks.py"/>
+<archivo path="backend/migrations/versions/007_p1_ia_loop.py"/>
+<archivo path="backend/migrations/versions/008_p1_logistica_kafka.py"/>
+<archivo path="backend/migrations/versions/009_p2_kiosco_casbin.py"/>
+<archivo path="backend/migrations/versions/010_p2_campanas_contabilidad.py"/>
+<archivo path="backend/migrations/versions/011_p2_soporte_billing.py"/>
+<archivo path="backend/migrations/versions/012_p2_dlq.py"/>
+<archivo path="backend/migrations/versions/013_p0_empaque.py"/>
+<archivo path="backend/migrations/versions/014_f17_outbox_flags.py" desc="F17: publicado_kafka + procesado_loyalty; drop procesado"/>
+<archivo path="backend/migrations/versions/015_f18_talertasreposicion.py" desc="F18: restaura tabla de alerta interna"/>
+<archivo path="backend/tests/conftest.py"/>
+<archivo path="backend/tests/fixtures/seed_data.py"/>
+<archivo path="backend/tests/smoke/test_health.py"/>
+<archivo path="backend/tests/e2e/test_auth_flow.py"/>
+<archivo path="backend/tests/e2e/test_multi_tenant.py"/>
+<archivo path="backend/tests/e2e/test_pos_sync_flow.py"/>
+<archivo path="backend/tests/e2e/test_cash_flow.py"/>
+<archivo path="backend/tests/e2e/test_fiscal_flow.py"/>
+<archivo path="backend/tests/e2e/test_reservation_sweeper.py" desc="F20: T12 sweeper ↔ vw_stock_sucursal"/>
+<archivo path="backend/tests/e2e/test_ecommerce_flow.py"/>
+<archivo path="backend/tests/e2e/test_checkout_flow.py"/>
+<archivo path="backend/tests/e2e/test_webhook_payments.py"/>
+<archivo path="backend/tests/e2e/test_whatsapp_webhook.py" desc="F19: T11 webhook tenant isolation"/>
+<archivo path="backend/tests/e2e/test_rag_pipeline.py"/>
+<archivo path="backend/tests/e2e/test_ia_loop_agents.py"/>
+<archivo path="backend/tests/e2e/test_shipping_flow.py"/>
+<archivo path="backend/tests/e2e/test_kafka_publish.py"/>
+<archivo path="backend/tests/e2e/test_courier_hub.py"/>
+<archivo path="backend/tests/e2e/test_kiosco_flow.py"/>
+<archivo path="backend/tests/e2e/test_casbin_permissions.py"/>
+<archivo path="backend/tests/e2e/test_campanas_flow.py"/>
+<archivo path="backend/tests/e2e/test_contabilidad_flow.py"/>
+<archivo path="backend/tests/e2e/test_soporte_flow.py"/>
+<archivo path="backend/tests/e2e/test_carga_masiva_flow.py"/>
+<archivo path="backend/tests/e2e/test_comisiones_flow.py"/>
+<archivo path="backend/tests/e2e/test_dlq_flow.py"/>
+<archivo path="backend/tests/e2e/test_crm_omnicanal.py" desc="R5: CRM Omnicanal tests"/>
+<archivo path="backend/tests/e2e/test_handoff.py" desc="NUEVO v2.3.1: Handoff Inteligente tests"/>
+<archivo path="backend/tests/integration/test_outbox_worker.py" desc="F17: verifica P0-aware"/>
+<archivo path="backend/tests/integration/test_loyalty_worker.py" desc="F17: verifica procesado_loyalty"/>
+<archivo path="backend/tests/integration/test_cfdi_worker.py"/>
+<archivo path="backend/tests/integration/test_dlq_consumer.py"/>
+<archivo path="backend/tests/performance/k6-baseline.js"/>
+<archivo path="backend/tests/performance/k6-regreso-clases.js"/>
+<archivo path="backend/tests/performance/k6-black-friday.js"/>
+<archivo path="backend/tests/performance/k6-cold-start.js"/>
+<archivo path="backend/tests/performance/k6-dlq-storm.js"/>
+<archivo path="backend/tests/performance/README.md"/>
+<archivo path="backend/scripts/generate_hashes.py"/>
+<archivo path="backend/scripts/seed_run.py"/>
+</carpeta_backend>
+
+<carpeta_frontend_pos>
+<archivo path="frontend/pos/package.json"/>
+<archivo path="frontend/pos/vite.config.ts"/>
+<archivo path="frontend/pos/tailwind.config.js"/>
+<archivo path="frontend/pos/index.html"/>
+<archivo path="frontend/pos/public/manifest.json"/>
+<archivo path="frontend/pos/public/sw.ts"/>
+<archivo path="frontend/pos/src/main.tsx"/>
+<archivo path="frontend/pos/src/App.tsx"/>
+<archivo path="frontend/pos/src/api/client.ts"/>
+<archivo path="frontend/pos/src/api/outboxSync.ts" desc="F21+F38: logger estructurado + getNextFolio canonizado"/>
+<archivo path="frontend/pos/src/lib/logger.ts" desc="F21: logger dev-only estructurado"/>
+<archivo path="frontend/pos/src/db/dexieDb.ts"/>
+<archivo path="frontend/pos/src/hardware/scaleReader.ts"/>
+<archivo path="frontend/pos/src/hardware/printerESC.ts"/>
+<archivo path="frontend/pos/src/hardware/barcodeListener.ts"/>
+<archivo path="frontend/pos/src/components/POS.tsx"/>
+<archivo path="frontend/pos/src/components/CartPanel.tsx"/>
+<archivo path="frontend/pos/src/components/ProductDetail.tsx"/>
+<archivo path="frontend/pos/src/components/VirtualKeyboard.tsx"/>
+<archivo path="frontend/pos/src/components/PaymentModal.tsx" desc="F21: showToast (no alert)"/>
+<archivo path="frontend/pos/src/components/CorteCajaModal.tsx"/>
+<archivo path="frontend/pos/src/components/AparadosModal.tsx"/>
+<archivo path="frontend/pos/src/components/DevolucionModal.tsx"/>
+<archivo path="frontend/pos/src/components/GranelModal.tsx"/>
+<archivo path="frontend/pos/src/components/ImpresionCotizadorModal.tsx"/>
+<archivo path="frontend/pos/src/components/RecargasModal.tsx"/>
+<archivo path="frontend/pos/src/components/SyncStatusIndicator.tsx"/>
+<archivo path="frontend/pos/src/components/Toast.tsx" desc="F21: expone useToast()"/>
+<archivo path="frontend/pos/src/components/LoginModal.tsx"/>
+<archivo path="frontend/pos/src/store/cartStore.ts"/>
+<archivo path="frontend/pos/src/store/stockCache.ts"/>
+<archivo path="frontend/pos/src/store/outboxStore.ts"/>
+<archivo path="frontend/pos/src/store/hardwareStore.ts"/>
+<archivo path="frontend/pos/src/styles/paleta-cian.css"/>
+</carpeta_frontend_pos>
+
+<carpeta_frontend_web>
+<archivo path="frontend/web/package.json"/>
+<archivo path="frontend/web/next.config.js"/>
+<archivo path="frontend/web/tailwind.config.js"/>
+<archivo path="frontend/web/app/layout.tsx"/>
+<archivo path="frontend/web/app/page.tsx"/>
+<archivo path="frontend/web/app/globals.css"/>
+<archivo path="frontend/web/app/(catalogo)/layout.tsx"/>
+<archivo path="frontend/web/app/(catalogo)/[silo]/page.tsx"/>
+<archivo path="frontend/web/app/(catalogo)/[silo]/[slug]/page.tsx"/>
+<archivo path="frontend/web/app/(catalogo)/buscar/page.tsx"/>
+<archivo path="frontend/web/app/(catalogo)/guia/[tema]/page.tsx"/>
+<archivo path="frontend/web/app/carrito/page.tsx"/>
+<archivo path="frontend/web/app/sitemap.ts"/>
+<archivo path="frontend/web/app/robots.ts"/>
+<archivo path="frontend/web/components/Navigation.tsx"/>
+<archivo path="frontend/web/components/Footer.tsx"/>
+<archivo path="frontend/web/components/ProductCard.tsx"/>
+<archivo path="frontend/web/components/CategoryCard.tsx"/>
+<archivo path="frontend/web/components/GuiaCard.tsx"/>
+<archivo path="frontend/web/components/AddToCartButton.tsx"/>
+<archivo path="frontend/web/components/CartDrawer.tsx"/>
+<archivo path="frontend/web/lib/api.ts"/>
+<archivo path="frontend/web/lib/jsonld.ts"/>
+<archivo path="frontend/web/lib/cart-bridge.ts"/>
+<archivo path="frontend/web/lib/seo.ts"/>
+<archivo path="frontend/web/lib/silos.ts"/>
+</carpeta_frontend_web>
+
+<carpeta_frontend_checkout>
+<archivo path="frontend/checkout/package.json"/>
+<archivo path="frontend/checkout/vite.config.ts"/>
+<archivo path="frontend/checkout/tailwind.config.js"/>
+<archivo path="frontend/checkout/index.html"/>
+<archivo path="frontend/checkout/src/main.tsx"/>
+<archivo path="frontend/checkout/src/App.tsx"/>
+<archivo path="frontend/checkout/src/styles.css"/>
+<archivo path="frontend/checkout/src/store/checkoutStore.ts"/>
+<archivo path="frontend/checkout/src/types/checkout.ts"/>
+<archivo path="frontend/checkout/src/services/api.ts"/>
+<archivo path="frontend/checkout/src/services/checkout.ts"/>
+<archivo path="frontend/checkout/src/services/shipping.ts"/>
+<archivo path="frontend/checkout/src/services/mercadopago.ts"/>
+<archivo path="frontend/checkout/src/components/CheckoutLayout.tsx"/>
+<archivo path="frontend/checkout/src/components/ShippingAddress.tsx"/>
+<archivo path="frontend/checkout/src/components/ShippingOptions.tsx"/>
+<archivo path="frontend/checkout/src/components/PaymentMethods.tsx"/>
+<archivo path="frontend/checkout/src/components/OrderSummary.tsx"/>
+<archivo path="frontend/checkout/src/components/CartItems.tsx"/>
+<archivo path="frontend/checkout/src/components/PromoCode.tsx"/>
+<archivo path="frontend/checkout/src/components/SubmitButton.tsx"/>
+</carpeta_frontend_checkout>
+
+<carpeta_frontend_kiosco>
+<archivo path="frontend/kiosco/index.html" desc="Single-file HTML dev (prototipo oficial con Babel)"/>
+<archivo path="frontend/kiosco/kiosco.config.ts" desc="F27: config Vite para bundle prod sin Babel"/>
+<archivo path="frontend/kiosco/dist/index.html" desc="F27: bundle prod (generado, sin unsafe-eval)"/>
+<archivo path="frontend/kiosco/manifest.json"/>
+<archivo path="frontend/kiosco/README.md" desc="F27: documenta dev (single-file) vs prod (build)"/>
+</carpeta_frontend_kiosco>
+
+<carpeta_frontend_empaque>
+<archivo path="frontend/empaque/index.html" desc="Estación PAMAD Ricoh-adapted"/>
+<archivo path="frontend/empaque/manifest.json"/>
+</carpeta_frontend_empaque>
+
+<carpeta_mobile>
+<archivo path="mobile/repartidor/package.json"/>
+<archivo path="mobile/repartidor/app.json"/>
+<archivo path="mobile/repartidor/App.tsx"/>
+<archivo path="mobile/repartidor/src/services/api.ts"/>
+<archivo path="mobile/repartidor/src/context/AuthContext.tsx"/>
+<archivo path="mobile/repartidor/src/screens/LoginScreen.tsx"/>
+<archivo path="mobile/repartidor/src/screens/DeliveryListScreen.tsx"/>
+<archivo path="mobile/repartidor/src/screens/DeliveryDetailScreen.tsx"/>
+</carpeta_mobile>
+
+<carpeta_docker>
+<archivo path="docker/init-scripts/01-extensions.sql"/>
+<archivo path="docker/init-scripts/02-roles.sql"/>
+<archivo path="docker/init-scripts/03-functions.sql"/>
+<archivo path="docker/init-scripts/04-rls-suite.sql"/>
+<archivo path="docker/init-db.sql" desc="DDL P0 completo (roles + 49 tablas + RLS)"/>
+<archivo path="docker/seed_data.sql"/>
+<archivo path="docker/prometheus/prometheus.yml"/>
+<archivo path="docker/prometheus/alerts.rules.yml" desc="15 alertas"/>
+<archivo path="docker/grafana/provisioning/datasources/datasources.yml"/>
+<archivo path="docker/grafana/provisioning/dashboards/dashboards.yml"/>
+<archivo path="docker/grafana/dashboards/erp-main.json"/>
+<archivo path="docker/grafana/dashboards/dlq-console.json"/>
+<archivo path="docker/grafana/dashboards/pool-saturation.json"/>
+<archivo path="docker/loki/loki-config.yml"/>
+<archivo path="docker/pgbouncer/pgbouncer.ini"/>
+<archivo path="docker/pgbouncer/userlist.txt"/>
+<archivo path="docker/nginx/nginx.conf"/>
+<archivo path="docker/vault/vault-config.hcl"/>
+</carpeta_docker>
+
+<carpeta_k8s>
+<archivo path="k8s/helm/papelmaind/Chart.yaml"/>
+<archivo path="k8s/helm/papelmaind/values.yaml"/>
+<archivo path="k8s/helm/papelmaind/values.staging.yaml"/>
+<archivo path="k8s/helm/papelmaind/values.production.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/_helpers.tpl"/>
+<archivo path="k8s/helm/papelmaind/templates/namespace.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/deployment-api.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/deployment-web.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/statefulset-workers.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/statefulset-postgres.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/statefulset-redis.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/statefulset-kafka.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/deployment-pgbouncer.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/service.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/ingress.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/hpa.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/secret.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/configmap.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/serviceaccount.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/networkpolicy.yaml"/>
+<archivo path="k8s/helm/papelmaind/templates/pdb.yaml"/>
+<archivo path="k8s/argocd/app-of-apps.yaml"/>
+<archivo path="k8s/argocd/projects.yaml"/>
+<archivo path="k8s/README.md"/>
+</carpeta_k8s>
+
+<carpeta_docs>
+<archivo path="docs/ARCHITECTURE.md"/>
+<archivo path="docs/SETUP.md"/>
+<archivo path="docs/DEPLOYMENT.md"/>
+<archivo path="docs/OPERATIONS.md"/>
+<archivo path="docs/TROUBLESHOOTING.md"/>
+<archivo path="docs/DLQ_CONSOLE.md"/>
+<archivo path="docs/POOL_SIZING.md"/>
+<archivo path="docs/CALIBRATION_ACTA.md"/>
+<archivo path="docs/RUNBOOK.md"/>
+<archivo path="docs/SECURITY.md"/>
+<archivo path="docs/ONBOARDING_TENANT.md"/>
+<archivo path="docs/WHATSAPP_ONBOARDING.md" desc="F28: runbook onboarding WhatsApp Business MX"/>
+<archivo path="docs/CRM_OMNICANAL.md" desc="R5: Documentación del Panel CRM Omnicanal"/>
+<archivo path="docs/LLM_GATEWAY.md" desc="NUEVO v2.3.1: Documentación del Motor BYO-LLM"/>
+<archivo path="docs/HANDOFF.md" desc="NUEVO v2.3.1: Documentación del Escalamiento Inteligente"/>
+<archivo path="docs/API_REFERENCE.md" desc="F26: generado por scripts/gen_docs.py desde OpenAPI"/>
+<archivo path="docs/DATABASE.md" desc="F26: generado por scripts/gen_docs.py desde modelos"/>
+<archivo path="docs/diagrams/uml-01-estados-venta.puml"/>
+<archivo path="docs/diagrams/uml-29-secuencia-replay-batch.puml"/>
+</carpeta_docs>
+
+<carpeta_context_engineer>
+<archivo path="context-engineer/papelmaind_context_engineer_v2.3.1.xml" desc="Este archivo XML"/>
+<archivo path="context-engineer/papelmaind_context_engineer_v2.2.1.xml" desc="Congelado como histórico pre-rebrand"/>
+<archivo path="context-engineer/CHANGELOG.md"/>
+</carpeta_context_engineer>
+
+<comandos_git_obligatorios>
+<bloque><![CDATA[
+# 1. Inicializar repo local
+cd papelmaind
+git init -b main
+git add .
+git commit -m "feat: PapelMaind v2.3.1 — SaaS omnicanal completo (fix pack F17-F38 + rebrand + CRM + BYO-LLM + Handoff)
+- 120 tablas PostgreSQL con RLS (R5 añade tconversaciones_omnicanal)
+- Outbox con flags separados (F17: publicado_kafka + procesado_loyalty)
+- Webhook WhatsApp tenant-isolated (F19: resolve_tenant_context)
+- Reserva carrito por aplicación (F20: cart_service, no trigger)
+- Código canon sin alert/console (F21: Toast + logger)
+- Anexo S: mapeo enums DB ↔ eventos (F22)
+- docker-compose completo con 9 workers + frontends (F23)
+- catalogo_claves_config restaurado + zona_horaria por tenant (F24)
+- CFDI totales agregados desde líneas (F25)
+- Conteo métricas corregido + workers 11-12 renombrados (F26)
+- Kiosco bundle prod sin Babel/unsafe-eval (F27)
+- Proceso RFC-lite + scripts/canon_lint.py + CI gate (F28)
+- Tests T11 (webhook tenant) + T12 (sweeper) añadidos
+- F29-F38: DLQ replay, FEFO stock_reservado, stock_minimo, asyncpg ANY, ObjetoImp dinámico, notification_worker unificado, CFDI XML válido, token WhatsApp por tenant, UNIQUE whatsapp_phone_number_id, helpers canonizados
+- R1-R8: métricas 24 reales, árbol completo, TLLMBudgetLog restaurado, CHK-39, CRM Omnicanal, autocontenido, rebrand PapelMaind, linaje correcto
+- Motor BYO-LLM (Kimi, Qwen, DeepSeek, Claude, OpenAI GPT-4o, modelos locales)
+- Panel CRM Omnicanal Unificado (WA, IG, FB, Telegram, Email, Web)
+- Escalamiento Inteligente (Handoff) con 3 disparadores
+- Prompt maestro recalibrado (sprint-based)
+- Re-corte P0 → P0-núcleo (S1-3.5) + P0.5 (S4-4.5)"
+# 2. Conectar con GitHub (crear repo vacío en github.com primero)
+git remote add origin https://github.com/[usuario]/papelmaind.git
+# 3. Push
+git push -u origin main
+# 4. Crear rama develop
+git checkout -b develop
+git push -u origin develop
+# 5. Tag v2.3.1
+git tag -a canon-v2.3.1 -m "Canon v2.3.1 (F17-F38 + R1-R8 aplicados, lint limpio, rebrand PapelMaind)"
+git push origin canon-v2.3.1
+]]></bloque>
+</comandos_git_obligatorios>
+</seccion_11_estructura_repositorio>
+
+<!-- ============================================================================ -->
+<!-- SECCIÓN 12: CHECKLIST DE ENTREGA (DoD) — R4: 39 CHKs restaurados            -->
+<!-- ============================================================================ -->
+<seccion_12_checklist_entrega fase="Transversal">
+<descripcion>
+Un módulo/sprint/fase SOLO se declara "completado" cuando TODOS estos checks
+están verdes. La IA debe imprimir este checklist al final de cada entrega.
+</descripcion>
+<checklist_por_sprint>
+<categoria nombre="Código">
+<check id="CHK-01">Todos los archivos de la fase tienen RUTA COMPLETA desde la raíz</check>
+<check id="CHK-02">No hay fragmentos sueltos, TODOs sin contexto, ni código placeholder</check>
+<check id="CHK-03">Imports resuelven (no hay ImportError)</check>
+<check id="CHK-04">Ruff pasa sin errores</check>
+<check id="CHK-05">Mypy pasa (con --ignore-missing-imports si aplica)</check>
+<check id="CHK-06">Bandit no reporta HIGH/CRITICAL</check>
+</categoria>
+<categoria nombre="Base de Datos">
+<check id="CHK-07">Migración Alembic generada y aplicable (upgrade head)</check>
+<check id="CHK-08">RLS activo en TODAS las tablas con papeleria_id</check>
+<check id="CHK-09">Seed corre sin errores (generate_hashes.py ejecutado)</check>
+<check id="CHK-10">Verificación seed pasa (counts esperados)</check>
+</categoria>
+<categoria nombre="Tests">
+<check id="CHK-11">T1-T12 verdes (los aplicables a la fase)</check>
+<check id="CHK-12">Smoke test pasa</check>
+<check id="CHK-13">Coverage ≥ 70% en módulos nuevos</check>
+<check id="CHK-14">Tests corren 3 veces consecutivas sin flakiness</check>
+</categoria>
+<categoria nombre="Workers / Eventos">
+<check id="CHK-15">Workers usan WorkerSessionLocal (no AsyncSessionLocal)</check>
+<check id="CHK-16">Outbox se escribe en la MISMA transacción ACID del agregado</check>
+<check id="CHK-17">Eventos validan contra JSON Schema antes de publicar</check>
+<check id="CHK-18">DLQ terminal funciona (3 intentos → tdlq_eventos + dlq.events)</check>
+</categoria>
+<categoria nombre="Frontend">
+<check id="CHK-19">Paleta correcta por contexto (cian POS/Kiosco · Azul Maind Web/Admin)</check>
+<check id="CHK-20">WCAG AA (contraste ≥4.5:1, táctil ≥38px, focus-visible)</check>
+<check id="CHK-21">No hay alert/prompt/confirm (usar Toast)</check>
+<check id="CHK-22">No hay console.log/console.error (usar logger estructurado)</check>
+<check id="CHK-23">i18n: TODAS las strings vía claves, no hardcodeadas</check>
+</categoria>
+<categoria nombre="Documentación">
+<check id="CHK-24">README actualizado con cambios del sprint</check>
+<check id="CHK-25">CHANGELOG actualizado</check>
+<check id="CHK-26">Si hay nuevo endpoint: documentado en docs/API_REFERENCE.md</check>
+<check id="CHK-27">Si hay nueva tabla: documentada en docs/DATABASE.md</check>
+</categoria>
+<categoria nombre="Canon / Gobernanza">
+<check id="CHK-28">scripts/canon_lint.py corre limpio en CI (gate obligatorio antes de merge)</check>
+<check id="CHK-29">Los fixes nuevos entran vía RFC-lite (Anexo T) — Anexo B congelado</check>
+<check id="CHK-30">Enums DB ↔ eventos consistentes (Anexo S) o mapeo documentado</check>
+<check id="CHK-31">catalogo_claves_config presente (18 claves cerradas) + get_config_value usado</check>
+<check id="CHK-32">outbox_worker es P0-aware (skip si no hay KAFKA_BOOTSTRAP_SERVERS)</check>
+<check id="CHK-33">loyalty_worker polllea por procesado_loyalty=false y lo marca al final</check>
+<check id="CHK-34">T11 (webhook tenant isolation F19) verde y bloqueante antes de Sprint 7</check>
+<check id="CHK-35">T12 (sweeper ↔ vw_stock_sucursal F20) verde antes de Sprint 3.5</check>
+<check id="CHK-36">Kiosco prod bundle sin unsafe-eval en CSP + sin babel standalone en dist (F27)</check>
+<check id="CHK-37">DLQ replay resetea publicado_kafka=false (no procesado) (F29)</check>
+<check id="CHK-38">FEFOAllocator decrementa stock_reservado al liquidar (F30)</check>
+<check id="CHK-39">LLM Gateway registra uso en TLLMBudgetLog (R3)</check>
+</categoria>
+<categoria nombre="Entrega">
+<check id="CHK-40">Árbol del repositorio impreso al final</check>
+<check id="CHK-41">Comandos git init → push impresos</check>
+<check id="CHK-42">Directorio .gitkeep en carpetas vacías de fases futuras</check>
+</categoria>
+</checklist_por_sprint>
+
+<checklist_por_fase>
+<fase id="P0-nucleo" sprints="S1-S3.5">
+<check>49 tablas P0 + RLS + funciones UUID v7 implementadas</check>
+<check>Auth multi-tenant + JWT + 2FA + OTP funcional</check>
+<check>POS PWA con Dexie + Service Worker + teclado 3-modos (F21: sin alert/console)</check>
+<check>FEFO allocator con lock artículo + lotes (F30: decrementa stock_reservado)</check>
+<check>Reserva carrito por aplicación (F20: cart_service, NO trigger)</check>
+<check>Outbox con flags separados (F17: publicado_kafka + procesado_loyalty)</check>
+<check>Workers P0-núcleo: outbox (P0-aware), loyalty (procesado_loyalty), reservation_sweeper</check>
+<check>Cajas independientes + cortes por caja</check>
+<check>Tests T1-T5, T7, T12 verdes</check>
+<check>Seed 2 tenants + 100 arts + 10 lotes + 5 clientes + 3 cajas</check>
+<check>docker-compose completo (F23: 9 workers + frontends)</check>
+<check>S3.5 demo vendible: vender offline + sync idempotente + corte por caja</check>
+</fase>
+<fase id="P0.5" sprints="S4-S4.5">
+<check>Aparados + TAE + cotizador impresión</check>
+<check>Autofactura QR + CFDI PAC sandbox (F25+F35: totales desde líneas + XML válido)</check>
+<check>Los 9 workers completos (incluye cfdi, inventory_alert, notification, ia_loop, ai_campaign, dlq_consumer)</check>
+<check>Tests T8, T9, T10 verdes</check>
+<check>catalogo_claves_config restaurada (F24)</check>
+<check>Conteo métricas corregido (R1: 24 reales)</check>
+<check>Sprint 4.5: k6 ×5 verdes + DLQ drill + acta calibración firmada</check>
+</fase>
+<fase id="P1">
+<check>E-commerce Next.js con SEO/JSON-LD + GEO/AEO</check>
+<check>Checkout Vite + Zustand Amazon-style</check>
+<check>MercadoPago + webhooks HMAC idempotentes</check>
+<check>WhatsApp bot híbrido con RAG 3 niveles + handoff (F19: tenant isolated, T11 verde)</check>
+<check>IA Loop 5 agentes con LangGraph + LLM routing</check>
+<check>CFDI global nocturno</check>
+<check>Logística 8 couriers + empaque</check>
+<check>Calendario Google sync + recordatorios (F24: zona_horaria por tenant)</check>
+<check>Kafka real (publicado_kafka gate activo)</check>
+<check>Anexo S (F22): mapeo enums DB ↔ eventos documentado</check>
+<check>Motor BYO-LLM con Kimi, Qwen, DeepSeek, Claude, OpenAI GPT-4o, modelos locales</check>
+<check>Panel CRM Omnicanal Unificado (WA, IG, FB, Telegram, Email, Web)</check>
+<check>Escalamiento Inteligente (Handoff) con 3 disparadores</check>
+</fase>
+<fase id="P2">
+<check>Kiosco single-file HTML con teclado 3-modos (dev) + prod bundle sin Babel (F27)</check>
+<check>Casbin custom roles</check>
+<check>DLQ Console + 6 endpoints admin + dashboard</check>
+<check>Pool sizing con PgBouncer</check>
+<check>K8s + Helm + ArgoCD + Vault</check>
+<check>App Repartidor Expo</check>
+<check>Promociones ricas + campañas + contabilidad</check>
+<check>Alertas 15 con validación</check>
+</fase>
+<fase id="P3">
+<check>Marketplace UberEats/RappiTurbo</check>
+<check>MLService predictivo</check>
+<check>GEO/AEO contenido curado automatizado</check>
+<check>LATAM 15+ idiomas</check>
+</fase>
+</checklist_por_fase>
+
+<definicion_de_done>
+<regla>
+Un sprint se declara DONE cuando:
+1. Todos los CHK-01..CHK-42 aplicables están verdes
+2. El checklist de fase correspondiente está verde
+3. El usuario aprueba la entrega
+</regla>
+<prohibido_declarar_done>
+Si algún check está en amarillo o rojo, el sprint sigue "in_progress".
+</prohibido_declarar_done>
+<gate_obligatorio fix="F28">
+`make canon-lint` DEBE estar verde antes de cualquier merge del XML.
+El Anexo B queda congelado como histórico — los fixes nuevos entran vía RFC-lite (Anexo T).
+</gate_obligatorio>
+</definicion_de_done>
+</seccion_12_checklist_entrega>
+
+<!-- ============================================================================ -->
+<!-- CIERRE DEL CANON CONSOLIDADO PAPELMAIND v2.3.1                               -->
+<!-- ============================================================================ -->
+<cierre version="2.3.1" fecha="2026-10-19" predecesor="2.2.1">
+<resumen>
+Canon consolidado PapelMaind v2.3.1 (fix pack F17-F38 + R1-R8 aplicado):
+· 120 tablas documentadas (119 base + tconversaciones_omnicanal R5)
+· 60+ endpoints REST
+· 18 topics Kafka con JSON Schemas completos
+· 9 workers asíncronos con código corregido (F17 P0-aware + F18 talertasreposicion + F36 token WhatsApp por tenant)
+· 24 métricas Prometheus reales (R1) + 15 alertas
+· 29 diagramas UML embebidos en PlantUML
+· 18 convenciones (CONV-01 a CONV-18) + excepción F20 (CONV-17)
+· 18 reglas de generación (RG-01 a RG-18, F19/F20/F28 añadidas)
+· 42 checks de entrega (CHK-01 a CHK-42, R4 restaura 39 originales + 3 nuevos)
+· 20 anexos (A-T: F22 añade S, F28 añade T)
+· 5 escenarios k6 + Sprint 4.5 calibración
+· Tests T1-T12 (F19: T11 webhook, F20: T12 sweeper)
+· docker-compose completo con 9 workers + frontends (F23)
+· Prompt maestro recalibrado sprint-based
+· scripts/canon_lint.py + CI gate (.github/workflows/canon-lint.yml)
+· Migraciones 001-015 completas (R2)
+· Re-corte P0: P0-núcleo (S1-S3.5) + P0.5 (S4-S4.5)
+· Proceso RFC-lite formalizado (F28, Anexo T)
+· Kiosco prod bundle sin Babel/unsafe-eval (F27)
+· Motor BYO-LLM con Kimi, Qwen, DeepSeek, Claude, OpenAI GPT-4o, modelos locales (NUEVO v2.3.1)
+· Panel CRM Omnicanal Unificado con Bandeja única + Contexto Tenant/Cliente (NUEVO v2.3.1)
+· Escalamiento Inteligente (Handoff) con 3 disparadores + resumen IA (NUEVO v2.3.1)
+· Rebrand completo: PapelMaind en todo el documento + dominios papelmaind.com (R7)
+· Linaje correcto: predecesor="2.2.1" (R8)
+· Nota legal IMPI actualizada para validar "PapelMaind" antes de uso comercial
+</resumen>
+<enmiendas_aplicadas total="34" rango="RFC-017 a RFC-046">
+F17 · F18 · F19 · F20 · F21 · F22 · F23 · F24 · F25 · F26 · F27 · F28 · F29 · F30 · F31 · F32 · F33 · F34 · F35 · F36 · F37 · F38 · R1 · R2 · R3 · R4 · R5 · R6 · R7 · R8
+</enmiendas_aplicadas>
+<prompt_final es-MX="true">
+<texto><![CDATA[
+Actúa como Arquitecto de Software y Desarrollador Fullstack Senior. Vas a construir
+PapelMaind v2.3.1, un SaaS multi-tenant omnicanal para cadenas de papelerías de giro
+mixto (papelería, mercería, regalos, joyería, perfumería, dulcería, copiado/impresión,
+monografías, internet, TAE, tecnología).
+REGLA DE ORO: el repositorio completo es la SUMA ACUMULADA de sprints generados.
+NUNCA intentes generar todo el repo en una sola sesión — eso produce imports rotos
+(prohibido por ENT-03). Cada sesión genera UN sprint completo o UN módulo.
+ENTREGA OBLIGATORIA POR SPRINT:
+- UN REPOSITORIO GITHUB COMPLETO (no fragmentos sueltos).
+- Carpeta raíz `papelmaind/` con TODAS las subcarpetas de SECCIÓN 11.
+- Archivos raíz OBLIGATORIOS: README.md, LICENSE, .gitignore, .env.example,
+Makefile, docker-compose.yml, pyproject.toml, .pre-commit-config.yaml.
+- Cada archivo de código con RUTA COMPLETA desde la raíz.
+- Tests del sprint VERDES en la MISMA entrega.
+- Al cerrar: árbol + `git add . &amp;&amp; git commit -m "sprint(N)"`.
+REGLAS TÉCNICAS NO NEGOCIABLES (F17-F38 + R1-R8 aplicadas):
+- Stack: FastAPI 0.115+ + Python 3.12 + SQLModel + PostgreSQL 16 + asyncpg + Redis 7
+- Frontend POS: React 18 + Vite + Tailwind (paleta CIAN) + Dexie.js + Zustand
+- Frontend Web: Next.js 14 App Router + Tailwind (Azul Maind #1A73E8) + Inter
+- Frontend Checkout: React 18 + Vite + Zustand (Amazon-style SPA aislada)
+- Kiosco: single-file HTML (dev) + vite build --config kiosco.config.ts (prod, F27)
+- UUID v7 en TODO (server + client_uuid POS)
+- Decimal en dinero (NUMERIC 12,2) y cantidad/granel (NUMERIC 12,3) — PROHIBIDO float
+- Estados en minúsculas (excepción estaciones.tipo MAYÚSCULAS documentada F26)
+- RLS FORCE+WITH CHECK en CADA tabla con papeleria_id
+- TenantUnitOfWork (SET LOCAL) tráfico autenticado
+- WorkerSessionLocal (erp_worker BYPASSRLS) en TODOS los workers
+- Outbox: flags separados F17 (publicado_kafka + procesado_loyalty)
+- Reserva carrito por APLICACIÓN, NO trigger (F20)
+- Webhook WhatsApp: resolve_tenant_by_phone → set_current_tenant ANTES de escribir (F19)
+- CFDI: TotalImpuestosTrasladados AGREGADO desde líneas (F25) + XML válido (F35)
+- Idempotencia UNIQUE+ON CONFLICT
+- Catálogo por tenant, stock por sucursal (tlotes + vw_stock_sucursal)
+- Caja ≠ Estación (F16)
+- CFDI unificado tipo='individual'|'global'
+- Hardware WebUSB/WebSerial/WebHID (PROHIBIDO Electron)
+- Offline-First: IndexedDB + SW + Background Sync
+- Pool sizing por fase (P0:20+10 · P1:10+5 · P2:5+3 · P2+:PgBouncer)
+- DLQ operativa: tdlq_eventos + /admin/dlq/* (replay 1000 + confirm)
+- Tests T1-T12 verdes antes de "completado"
+- NO alert()/console.log (F21: Toast + logger estructurado)
+- Enums DB↔eventos: mapeo Anexo S (F22)
+- Fixes nuevos: RFC-lite (F28, Anexo T)
+- canon_lint.py debe estar verde (F28, CI gate)
+- Motor BYO-LLM con routing inteligente + presupuesto + PII masking
+- Panel CRM Omnicanal Unificado con RLS + contexto tenant/cliente
+- Escalamiento Inteligente con 3 disparadores + resumen IA
+- Token WhatsApp por tenant desde papeleria_api_keys (F36)
+- UNIQUE parcial en whatsapp_phone_number_id (F37)
+- Helpers canonizados: getNextFolio, get_config_value, sweep_reservations_once (F38)
+SECUENCIA P0-NÚCLEO PRIMERO:
+S1 auth+RLS+UoW+seed → S2 catálogo+impuestos+lotes → S3 POS+sync+FEFO+caja+outbox
+→ S3.5 demo vendible → S4 aparados+TAE+cotizador+autofactura+CFDI+workers
+→ S4.5 calibración
+EMPIEZA: P0 Sprint 1 (auth + multi-tenant + RLS + seed).
+Respeta TODO el canon de este XML. Al terminar, imprime el árbol del repositorio.
+]]></texto>
+</prompt_final>
+<lint_config>
+<script path="scripts/canon_lint.py">Checks L1-L7: tablas fantasma, alert/console, conteos, enums, flags outbox, compose workers, helpers canonizados</script>
+<workflow path=".github/workflows/canon-lint.yml">Corre en cada PR/push a main/develop que toque context-engineer/**.xml o scripts/canon_lint.py</workflow>
+<makefile_target>make canon-lint</makefile_target>
+<gate>Exit 0 = limpio · Exit 1 = issues (bloquea merge)</gate>
+</lint_config>
+<nota_legal_impi>
+IMPI PapelMaind + defensiva. Verificar que "PapelMaind" no colisione con marcas existentes
+antes de uso comercial. Documentar búsqueda en Anexo I.
+</nota_legal_impi>
+</cierre>
+</papelmaind_context_engineer>
+<!-- ============================================================================ -->
+<!-- FIN DEL CANON CONSOLIDADO PAPELMAIND v2.3.1                                  -->
+<!-- Fecha: 19 de Octubre de 2026                                                 -->
+<!-- Fix pack: F17-F38 + R1-R8 · Tests T1-T12 · 120 tablas · 60+ endpoints        -->
+<!-- 18 topics · 9 workers · 24 métricas · 15 alertas · 5 k6 · 18 CONV            -->
+<!-- 18 RG · 29 UML · 20 anexos (A-T) · 42 CHK · RFC-lite · lint CI               -->
+<!-- Motor BYO-LLM + CRM Omnicanal + Handoff Inteligente                          -->
+<!-- Rebrand PapelMaind · Linaje v2.2.1 → v2.3.1                                  -->
+<!-- ============================================================================ -->
