@@ -1374,7 +1374,7 @@ están verdes. La IA debe imprimir este checklist al final de cada entrega.
 <check id="CHK-13">Coverage ≥ 70% en módulos nuevos</check>
 <check id="CHK-14">Tests corren 3 veces consecutivas sin flakiness</check>
 </categoria>
-<categoria nombre="Workers / Eventos">
+<categoria nombre="Workers / Eventos" total="16">
 <check id="CHK-15">Workers usan WorkerSessionLocal (no AsyncSessionLocal)</check>
 <check id="CHK-16">Outbox se escribe en la MISMA transacción ACID del agregado</check>
 <check id="CHK-17">Eventos validan contra JSON Schema antes de publicar</check>
