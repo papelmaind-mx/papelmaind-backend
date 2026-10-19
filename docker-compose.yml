@@ -1,0 +1,47 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: pm_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: papelmind
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: ${POSTGRES_ADMIN_PASSWORD:-admin_dev}
+    ports: ["5433:5432"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d papelmind"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    command: ["postgres", "-c", "max_connections=100"]
+
+  redis:
+    image: redis:7-alpine
+    container_name: pm_redis
+    restart: unless-stopped
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: { context: ./backend, dockerfile: Dockerfile.dev }
+    container_name: pm_api
+    command: uvicorn src.main:app --host 0.0.0.0 --port 8000 --reload
+    environment:
+      DATABASE_URL: postgresql+asyncpg://erp_app:${ERP_APP_PASSWORD:-erp_app_dev}@postgres:5432/papelmind
+      WORKER_DATABASE_URL: postgresql+asyncpg://erp_worker:${ERP_WORKER_PASSWORD:-erp_worker_dev}@postgres:5432/papelmind
+      JWT_SECRET: ${JWT_SECRET:-dev_secret_cambiar_min_32_chars_aqui!}
+      ENVIRONMENT: development
+    ports: ["8000:8000"]
+    volumes: ["./backend:/app"]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+volumes:
+  pgdata:

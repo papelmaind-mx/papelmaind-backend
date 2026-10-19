@@ -1,44 +1,72 @@
-name: Canon Lint (F28)
+name: Canon Lint
+
+# F28: Gate obligatorio — el XML canon se valida contra sí mismo antes de mergear.
+# Corre en cada PR/push que toque el XML o el propio script.
 
 on:
+  pull_request:
+    paths:
+      - 'context-engineer/**.xml'
+      - 'scripts/canon_lint.py'
+      - '.github/workflows/canon-lint.yml'
   push:
     branches: [main, develop]
     paths:
-      - 'context-engineer/**/*.xml'
+      - 'context-engineer/**.xml'
       - 'scripts/canon_lint.py'
-  pull_request:
-    branches: [main, develop]
-    paths:
-      - 'context-engineer/**/*.xml'
-      - 'scripts/canon_lint.py'
+  workflow_dispatch:  # permite correrlo manualmente desde la UI de GitHub
 
 jobs:
-  lint-canon:
-    name: Validar canon XML
+  lint:
+    name: Validar canon contra sí mismo
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout del repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.12
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Detectar XML canon
-        id: detect
+
+      - name: Localizar XML canon más reciente
+        id: find_xml
         run: |
-          XML_FILE=$(ls -t context-engineer/papelmind_context_engineer_v*.xml 2>/dev/null | head -1)
-          if [ -z "$XML_FILE" ]; then
-            echo "❌ No se encontró XML canon"
+          # Toma el XML más reciente en context-engineer/ (por nombre, ordenado)
+          XML=$(ls -t context-engineer/papelmaind_context_engineer_v*.xml 2>/dev/null | head -1)
+          if [ -z "$XML" ]; then
+            echo "❌ No se encontró ningún XML canon en context-engineer/"
+            echo "Archivos presentes:"
+            ls -la context-engineer/ || echo "(directorio vacío)"
             exit 1
           fi
-          echo "xml_file=$XML_FILE" >> $GITHUB_OUTPUT
+          echo "✅ XML a lintear: $XML"
+          echo "xml_path=$XML" >> "$GITHUB_OUTPUT"
+
+      - name: Verificar que el XML es bien formado (xmllint)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq libxml2-utils
+          xmllint --noout "${{ steps.find_xml.outputs.xml_path }}"
+          echo "✅ XML bien formado"
+
       - name: Correr canon_lint.py
-        run: python3 scripts/canon_lint.py --verbose "${{ steps.detect.outputs.xml_file }}"
-  validate-xml:
-    name: Validar XML well-formed
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: sudo apt-get update && sudo apt-get install -y libxml2-utils
-      - run: |
-          XML_FILE=$(ls -t context-engineer/papelmind_context_engineer_v*.xml 2>/dev/null | head -1)
-          xmllint --noout "$XML_FILE"
-          echo "✅ XML well-formed"
+        run: |
+          python scripts/canon_lint.py "${{ steps.find_xml.outputs.xml_path }}"
+
+      - name: Resumen del job
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "## ✅ Canon Lint — LIMPIO" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "El XML canon **${{ steps.find_xml.outputs.xml_path }}** pasó todos los checks (L1-L6)." >> $GITHUB_STEP_SUMMARY
+          else
+            echo "## ❌ Canon Lint — ISSUES DETECTADOS" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "El XML canon **${{ steps.find_xml.outputs.xml_path }}** tiene issues que bloquean el merge." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Revisar los logs del step *'Correr canon_lint.py'* para ver los detalles." >> $GITHUB_STEP_SUMMARY
+          fi

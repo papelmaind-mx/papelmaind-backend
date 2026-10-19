@@ -8,3 +8,13 @@ __pycache__/
 node_modules/
 *d3_xml.txt
 *.txt.bak
+.env
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+htmlcov/
+.coverage
+dist/
+pgdata/
+backend/.pytest_cache/

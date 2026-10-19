@@ -2610,7 +2610,43 @@ VENTA_COMPLETADA→sale.completed · VENTA_APARADA→layaway.created · STOCK_*�
 <anexo id="F" nombre="KPIs + microcopy"/>
 <anexo id="G" nombre="Cumplimiento legal MX"/>
 <anexo id="H" nombre="i18n"/>
-<anexo id="I" nombre="Brand quick-ref"/>
+<anexo id="I" nombre="Brand quick-ref + IMPI">
+  <brand>
+    <marca principal="PapelMaind"/>
+    <colores>
+      <contexto uso="POS/Kiosco" paleta="Cian #80FFFF · #84DCC6 · #C9FFE5"/>
+      <contexto uso="Web/Marketing" paleta="Azul Maind #1A73E8 · Inter"/>
+      <contexto uso="Admin/Backoffice" paleta="Azul Maind + alerta rojo #E53935"/>
+    </colores>
+    <tipografias>
+      <font uso="POS/Kiosco">DM Sans</font>
+      <font uso="Web/Admin">Inter</font>
+    </tipografias>
+  </brand>
+  <impi>
+    <marca>PapelMaind</marca>
+    <clases>
+      <clase numero="9" uso="software" desc="Programas de computación, software descargable"/>
+      <clase numero="35" uso="publicidad/negocio" desc="Publicidad, gestión de negocios comerciales"/>
+      <clase numero="39" uso="transporte/almacenaje" desc="Transporte, embalaje y almacenaje de mercancías"/>
+      <clase numero="42" uso="servicios tecnológicos" desc="Servicios científicos y tecnológicos, SaaS"/>
+    </clases>
+    <estado>pendiente_busqueda</estado>
+    <accion>
+      Búsqueda formal en IMPI antes de uso comercial.
+      Documentar resultado (marca libre / colisión) en este bloque.
+      Si hay colisión: rebrand a alternativo ("Papelero", "MaindPaper", "PapelOS").
+    </accion>
+    <responsable>equipo_legal + fundador</responsable>
+    <fecha_limite>antes_de_primer_pilot</fecha_limite>
+    <presupuesto_estimado_mxn>
+      <concepto nombre="Búsqueda de anterioridades" monto="2000-5000"/>
+      <concepto nombre="Registro de marca (1 clase)" monto="3000-6000"/>
+      <concepto nombre="Registro de marca (4 clases)" monto="12000-24000"/>
+      <concepto nombre="Honorarios gestor/abogado" monto="5000-15000"/>
+    </presupuesto_estimado_mxn>
+  </impi>
+</anexo>
 <anexo id="J" nombre="Contrato híbrido checkout"/>
 <anexo id="K" nombre="Deuda técnica (gaps no resueltos con sprint asignado)">
 <deuda sprint="P1-5" prioridad="alta">Implementar Redis DECRBY hot-path para stock &lt; 50 en add-to-cart</deuda>
@@ -2905,7 +2941,8 @@ relativas a la raíz del repositorio `papelmaind/`.
 </raiz_archivos>
 
 <carpeta_scripts>
-<archivo path="scripts/canon_lint.py" desc="F28: valida el XML canon contra sí mismo (CI gate)"/>
+<archivo path="scripts/canon_lint.py" desc="F28: valida el XML canon contra sí mismo (CI gate). Código abajo."/>
+<archivo path="scripts/consolidate_canon.sh" desc="Junta 1d3+2d3+3d3 + valida XML"/>
 <archivo path="scripts/deploy.sh"/>
 <archivo path="scripts/backup.sh"/>
 <archivo path="scripts/restore.sh"/>
@@ -2915,7 +2952,145 @@ relativas a la raíz del repositorio `papelmaind/`.
 <archivo path="scripts/run_k6_all.sh"/>
 <archivo path="scripts/close_v1.0.0.sh"/>
 </carpeta_scripts>
+<archivo_codigo path="scripts/canon_lint.py"><![CDATA[
+#!/usr/bin/env python3
+"""canon_lint.py — Valida el XML canon contra sí mismo (CI gate).
+Uso: python scripts/canon_lint.py <canon>.xml
+Exit 0 = limpio · Exit 1 = issues (bloquea merge)."""
+import re, sys
+import xml.etree.ElementTree as ET
+from pathlib import Path
 
+SQL_TABLE_RE = re.compile(r"(?:INSERT\s+INTO|UPDATE|FROM|JOIN)\s+([a-z_][a-z0-9_]*)", re.I)
+
+def lint(path):
+    issues = []
+    try:
+        root = ET.parse(path).getroot()
+    except ET.ParseError as e:
+        return [f"L0-XML_MALFORMED: {e}"]
+
+    modelos = {m.get("nombre") for m in root.iter("modelo")}
+    vistas = {v.get("nombre") for v in root.iter("vista")}
+    xml_text = Path(path).read_text(encoding="utf-8")
+
+    # L1 (F18): tablas en SQL de workers existen en modelos/vistas
+    for i, code in enumerate(root.iter("codigo")):
+        src = code.text or ""
+        for tbl in SQL_TABLE_RE.findall(src):
+            if tbl.split()[0] in ("select","text","generate_uuid_v7","set_current_tenant","any","cast","values","into"):
+                continue
+            if tbl not in modelos and tbl not in vistas and not tbl.startswith(("pg_","information_schema")):
+                issues.append(f"L1-TABLA_FANTASMA: '{tbl}' en bloque código #{i} no está en modelo/vista")
+
+    # L2 (F21): código canon sin alert/console
+    for i, code in enumerate(root.iter("codigo")):
+        src = code.text or ""
+        if "alert(" in src: issues.append(f"L2-ALERT: alert() en código #{i} (RG-02)")
+        if "console.log(" in src: issues.append(f"L2-LOG: console.log en código #{i} (RG-02)")
+        if re.search(r"['\"]kafka:9092['\"]", src): issues.append(f"L2-HARDCODE: kafka:9092 en #{i}")
+        if re.search(r'TasaOCuota="0\.160000"', src): issues.append(f"L2-CFDI: tasa hardcoded en #{i} (F25)")
+
+    # L3: conteo declarado vs real
+    for cat in root.iter("categoria"):
+        nombre, decl = cat.get("nombre",""), int(cat.get("total",0))
+        if "Tablas" in nombre:
+            real = len(modelos)
+            if decl != real: issues.append(f"L3-COUNT: '{nombre}' declara {decl}, hay {real} <modelo>")
+        if "Convenciones" in nombre:
+            real = len([r for r in root.iter("regla") if r.get("id","").startswith("CONV")])
+            if decl != real: issues.append(f"L3-COUNT: '{nombre}' declara {decl}, hay {real} CONV-*")
+        if "Workers" in nombre:
+            real = len(list(root.iter("worker")))
+            if decl != real: issues.append(f"L3-COUNT: '{nombre}' declara {decl}, hay {real} <worker>")
+        if "Métricas" in nombre:
+            real = len(list(root.iter("metrica")))
+            if decl != real: issues.append(f"L3-COUNT: '{nombre}' declara {decl}, hay {real} <metrica>")
+
+    # L4 (F22): enums DB ↔ eventos
+    if 'anexo id="S"' not in xml_text:
+        issues.append("L4-ENUM: falta Anexo S (mapeo enums DB ↔ eventos)")
+
+    # L5 (F17): flags outbox separados
+    for m in root.iter("modelo"):
+        if m.get("nombre") == "outbox_eventos":
+            campos = {c.get("name") for c in m.iter("campo")}
+            if "procesado" in campos and "procesado_loyalty" not in campos:
+                issues.append("L5-F17-REGRESION: outbox_eventos tiene 'procesado' sin flags por consumidor")
+            if "publicado_kafka" not in campos:
+                issues.append("L5-F17: outbox_eventos sin 'publicado_kafka'")
+
+    # L6 (F23): compose con workers
+    for dc in root.iter("docker_compose"):
+        code_el = dc.find("codigo")
+        code = code_el.text if code_el is not None and code_el.text else ""
+        if "outbox-worker" not in code:
+            issues.append("L6-F23: docker-compose sin servicio outbox-worker")
+        if "x-worker-env" in code and code.count("*worker-env") < 9:
+            issues.append(f"L6-F23: ancla x-worker-env definida pero solo usada {code.count('*worker-env')} veces (esperado 9)")
+
+    # L7 (F38): helpers canonizados
+    for h in ["getNextFolio", "getContextFromJWT", "sweep_reservations_once"]:
+        if h not in xml_text:
+            issues.append(f"L7-F38: helper canonizado '{h}' no encontrado")
+
+    # L8 (R3): LLM Gateway con TLLMBudgetLog
+    if "TLLMBudgetLog" not in xml_text:
+        issues.append("L8-R3: TLLMBudgetLog no referenciado en llm_gateway")
+
+    # L9 (F33+F35): CFDI ObjetoImp dinámico + < reales
+    if 'ObjetoImp="02"' in xml_text and "objeto_imp" not in xml_text:
+        issues.append("L9-F33: ObjetoImp hardcodeado (debe ser dinámico 01/02)")
+    if "&lt;cfdi:" in xml_text:
+        issues.append("L9-F35: XML CFDI con &lt; escapados (debe usar < reales en CDATA)")
+
+    # L10 (F37): UNIQUE whatsapp_phone_number_id
+    if "whatsapp_phone_number_id" not in xml_text:
+        issues.append("L10-F37: falta whatsapp_phone_number_id en catalogo_claves_config")
+
+    # L11 (F30): stock_reservado decrementado en FEFO
+    if "stock_reservado" in xml_text and "decrementar" not in xml_text.lower() and "F30" not in xml_text:
+        issues.append("L11-F30: falta decremento de stock_reservado en allocate_stock_fefo")
+
+    # L12 (F28): Anexo B congelado + RFC-lite
+    if "CONGELADO" not in xml_text:
+        issues.append("L12-F28: Anexo B no marcado como CONGELADO")
+    if 'anexo id="T"' not in xml_text:
+        issues.append("L12-F28: falta Anexo T (proceso RFC-lite)")
+
+    return issues
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Uso: python scripts/canon_lint.py <canon>.xml")
+        sys.exit(2)
+    issues = lint(sys.argv[1])
+    for i in issues: print(f"  ✗ {i}")
+    print(f"\n{'LIMPIO ✅' if not issues else f'{len(issues)} ISSUES ❌'}")
+    sys.exit(1 if issues else 0)
+]]></archivo_codigo>
+<archivo_codigo path=".github/workflows/canon-lint.yml"><![CDATA[
+name: Canon Lint
+on:
+  pull_request:
+    paths:
+      - 'context-engineer/**.xml'
+      - 'scripts/canon_lint.py'
+  push:
+    branches: [main, develop]
+    paths:
+      - 'context-engineer/**.xml'
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.12' }
+      - run: pip install --quiet lxml
+      - name: Lint canon
+        run: python scripts/canon_lint.py context-engineer/papelmaind_context_engineer_v2.3.1.xml
+]]></archivo_codigo>
 <carpeta_backend>
 <archivo path="backend/Dockerfile"/>
 <archivo path="backend/Dockerfile.dev"/>
@@ -3262,7 +3437,8 @@ relativas a la raíz del repositorio `papelmaind/`.
 <archivo path="docker/init-scripts/02-roles.sql"/>
 <archivo path="docker/init-scripts/03-functions.sql"/>
 <archivo path="docker/init-scripts/04-rls-suite.sql"/>
-<archivo path="docker/init-db.sql" desc="DDL P0 completo (roles + 49 tablas + RLS)"/>
+<archivo path="docker/init-db-p0.sql" desc="DDL P0-núcleo (roles + 49 tablas + RLS) — se aplica siempre"/>
+<archivo path="docker/init-db-full.sql" desc="DDL completo (120 tablas + RLS) — se aplica en staging/prod"/>
 <archivo path="docker/seed_data.sql"/>
 <archivo path="docker/prometheus/prometheus.yml"/>
 <archivo path="docker/prometheus/alerts.rules.yml" desc="15 alertas"/>
