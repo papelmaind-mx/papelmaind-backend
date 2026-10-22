@@ -3437,8 +3437,8 @@ jobs:
 <archivo path="docker/init-scripts/02-roles.sql"/>
 <archivo path="docker/init-scripts/03-functions.sql"/>
 <archivo path="docker/init-scripts/04-rls-suite.sql"/>
-<archivo path="docker/init-db-p0.sql" desc="DDL P0-núcleo (roles + 49 tablas + RLS) — se aplica siempre"/>
-<archivo path="docker/init-db-full.sql" desc="DDL completo (120 tablas + RLS) — se aplica en staging/prod"/>
+<archivo path="docker/init-db-p0.sql" desc="DDL de referencia P0-núcleo (49 tablas) — bootstrap sin Alembic"/>
+<archivo path="docker/init-db-full.sql" desc="DDL de referencia completo (120 tablas) — bootstrap sin Alembic"/>
 <archivo path="docker/seed_data.sql"/>
 <archivo path="docker/prometheus/prometheus.yml"/>
 <archivo path="docker/prometheus/alerts.rules.yml" desc="15 alertas"/>

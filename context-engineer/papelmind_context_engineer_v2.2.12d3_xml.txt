@@ -1,0 +1,2084 @@
+<!-- ============================================================================ -->
+<!-- SECCIÓN 5: CAPA BOT WHATSAPP HÍBRIDO + IA LOOP — F19 APLICADO (paso 3bis)   -->
+<!-- ============================================================================ -->
+<seccion_5_bot_ia fase="P1-P2">
+<webhook_endpoints>
+<endpoint metodo="GET" path="/api/v1/whatsapp/webhook" auth="NONE" desc="Verificación Meta">
+<params>hub.mode=subscribe · hub.verify_token · hub.challenge</params>
+<respuesta>hub.challenge si coincide; 403 si no</respuesta>
+</endpoint>
+<endpoint metodo="POST" path="/api/v1/whatsapp/webhook" auth="HMAC" rol_db="erp_worker">
+<validacion_hmac><![CDATA[
+import hmac, hashlib, os
+from fastapi import Request, HTTPException
+async def validar_hmac_meta(request: Request) -> None:
+    signature = request.headers.get("X-Hub-Signature-256", "").replace("sha256=", "")
+    body = await request.body()
+    secret = os.getenv("META_APP_SECRET", "")
+    if not secret:
+        return  # Dev sin secret
+    expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(signature, expected):
+        raise HTTPException(401, "Invalid signature")
+]]></validacion_hmac>
+<pipeline>
+<paso n="1">Parse JSON Meta → wa_id, mensaje, timestamp, mensaje_externo_id, phone_number_id (número RECEPTOR)</paso>
+<paso n="2">Rate limit Redis: INCR wa:{id} EXPIRE 60s; máx 30/min → 429</paso>
+<paso n="3bis" estado="FIX F19 — OBLIGATORIO antes de CUALQUIER escritura">
+resolve_tenant_by_phone(phone_number_id) → set_current_tenant(). El webhook corre
+con erp_worker (BYPASSRLS): sin este SET y sin papeleria_id explícito en cada
+INSERT/UPDATE, toda escritura es cross-tenant. Doble cinturón: (1) SET LOCAL,
+(2) papeleria_id explícito en cada sentencia.
+</paso>
+<paso n="3">Buscar/crear usuario + rel (platform_scoped_id=wa_id, scoped al tenant resuelto en 3bis)</paso>
+<paso n="4">Dedup por mensaje_externo_id → insertar tmensajes(entrante) con papeleria_id=tenant_id explícito</paso>
+<paso n="5">process_msg() → handler por estado (máquina de estados híbrida)</paso>
+<paso n="6">Insertar tmensajes(saliente, es_automatico=true) + enviar Cloud API</paso>
+<paso n="7">Timeout total &lt; 5s (Meta); si RAG lento → ack 200 + respuesta async en background</paso>
+</pipeline>
+
+<codigo_canonico fix="F19"><![CDATA[
+# src/api/v1/whatsapp.py
+from uuid import UUID
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import text
+from src.infrastructure.db.session import WorkerSessionLocal
+
+async def resolve_tenant_context(db, phone_number_id: str) -> UUID:
+    """F19: resuelve el tenant por el número RECEPTOR y acota la sesión.
+    El webhook corre con erp_worker (BYPASSRLS) → sin este SET, toda escritura
+    es cross-tenant. Regla: papeleria_id explícito en cada INSERT/UPDATE posterior."""
+    row = (await db.execute(text("""
+        SELECT papeleria_id FROM papeleria_configuracion
+        WHERE clave = 'whatsapp_phone_number_id' AND valor = :pnid
+        LIMIT 1
+    """), {"pnid": phone_number_id})).first()
+    if not row:
+        raise HTTPException(404, "Número receptor no mapeado a ningún tenant")
+    await db.execute(text("SELECT set_current_tenant(:t)"), {"t": str(row[0])})
+    return row[0]
+
+@router.post("/whatsapp/webhook")
+async def whatsapp_webhook(request: Request):
+    await validar_hmac_meta(request)
+    body = await request.json()
+    # ... parse body ...
+    phone_number_id = extract_phone_number_id(body)
+    async with WorkerSessionLocal() as db:
+        tenant_id = await resolve_tenant_context(db, phone_number_id)
+        # A partir de aquí, TODA escritura lleva papeleria_id=tenant_id explícito
+        await handle_inbound_message(db, tenant_id, body)
+        await db.commit()
+    return {"status": "ok"}
+]]></codigo_canonico>
+</endpoint>
+</webhook_endpoints>
+
+<!-- ============ MÁQUINA DE ESTADOS HÍBRIDA ============ -->
+<maquina_estados version="híbrida">
+<contexto>
+tmensajes.metadata o tabla tconversaciones(ctx JSONB):
+{estado_actual, id_carrito, lang, slot_tmp, intentos_rag, handoff, tenant_id}
+</contexto>
+<estado nombre="lang" fase_inicial="true"><inputs>1|español → es · 2|english → en · 3|fr · 4|ar(RTL) · auto-detect default es-MX</inputs><transicion destino="menu" accion="Guardar language_pref; crear carrito si no existe"/></estado>
+<estado nombre="menu">
+<inputs>
+<input codigo="[0-9]+">Añadir 1 unidad ítem N de página actual</input>
+<input codigo="[0-9]+ [0-9]+">Cantidad + ítem (ej: '2 5')</input>
+<input codigo="n|siguiente">Página siguiente (5 ítems/página con stock y precio)</input>
+<input codigo="c|confirmar">Checkout (carrito no vacío)</input>
+<input codigo="r|reservar|cita">Flujo citas</input>
+<input codigo="h|humano|asesor">Handoff: notifica operador + ventana 24h</input>
+<input codigo="q|salir">Vaciar carrito → lang</input>
+</inputs>
+<fallback_rag>
+Input NO numérico → RAG:
+nivel1 Redis FAQ (horarios/dirección/zonas ~0 costo)
+→ nivel2 pgvector top-5
+→ LLM chain
+→ respuesta natural con precio/stock/FEFO;
+2 errores consecutivos → ofrecer menú de nuevo.
+</fallback_rag>
+<handler><![CDATA[
+async def handle_menu(wa_id, msg, ctx, db):
+    parts = msg.strip().split()
+    if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+        cantidad, idx = int(parts[0]), int(parts[1])
+    elif len(parts) == 1 and parts[0].isdigit():
+        cantidad, idx = 1, int(parts[0])
+    else:
+        return await rag_respond(wa_id, msg, ctx, db)   # HÍBRIDO
+    articulo = await get_articulo_pagina(db, ctx['pagina'], idx)
+    if not articulo:
+        return error_item(ctx['lang'])
+    await add_item_carrito(db, UUID(ctx['id_carrito']), articulo.id,
+                           cantidad, articulo.precio_venta)
+    total = await recalcular_total_carrito(db, UUID(ctx['id_carrito']))
+    return confirmacion_item(ctx['lang'], articulo.descripcion, cantidad, total)
+]]></handler>
+</estado>
+<estado nombre="entrega">
+<inputs>1|recoger→tienda · 2|domicilio→zona</inputs>
+<transicion destino="pago"/>
+<transicion destino="zona" evento="domicilio"/>
+</estado>
+<estado nombre="zona">
+<validacion>Fuzzy SequenceMatcher 0.60 sobre tzonasenvio ACTIVAS (naming neutro)</validacion>
+<transicion destino="pago" evento="valida" accion="Guardar zona + costo_base"/>
+<transicion destino="zona" evento="inválida" accion="Listar zonas + IA sugiere dirección frecuente"/>
+</estado>
+<estado nombre="pago">
+<inputs>
+1|efectivo(recoger) · 2|tarjeta(recoger) · 3|transferencia(validado) · 4|online(link MP)
+</inputs>
+<transicion evento="efectivo" destino="cash_bill"/>
+<transicion evento="online" destino="confirmado" accion="MP preferencia + link + expira 24h"/>
+<regla>domicilio + tarjeta POS directo NO permitido (P0)</regla>
+</estado>
+<estado nombre="cash_bill">
+<inputs>monto billete</inputs>
+<transicion evento="suficiente" destino="confirmado"/>
+<transicion evento="insuficiente" accion="Error con total"/>
+<handler><![CDATA[
+async def handle_cash_bill(wa_id, msg, ctx, db):
+    total = await get_total_carrito(db, UUID(ctx['id_carrito']))
+    billete = parse_monto(msg)
+    if billete < total:
+        return error_billete(ctx['lang'], total, billete)
+    venta = await crear_venta_desde_carrito(
+        db, ctx, metodo='efectivo', estacion=WHA_APP_ESTACION
+    )
+    await crear_pagosventa(db, venta.id, 'efectivo', total)
+    await enqueue_event(db, tenant_id=ctx['tenant'],
+        event_type='sale.completed',
+        aggregate_type='venta', aggregate_id=venta.id,
+        payload=venta_payload(venta))  # MISMA transacción ACID
+    ctx['estado'] = 'confirmado'
+    return confirmacion_pedido(ctx['lang'], venta, cambio=billete - total)
+]]></handler>
+</estado>
+<estado nombre="res_c" desc="Citas paso 1: personas">
+<inputs>1|1 persona · 2|2 personas · 3|3+</inputs>
+<transicion destino="res_f"/>
+</estado>
+<estado nombre="res_f" desc="Citas paso 2: fecha">
+<inputs>1|hoy · 2|mañana · DD-MM-YYYY (ventana 30d)</inputs>
+<transicion destino="res_h"/>
+</estado>
+<estado nombre="res_h" desc="Citas paso 3: hora">
+<sql_bloqueo><![CDATA[
+-- Cita atómica contra CONTADOR de slot-template (sin materializar filas):
+UPDATE calendario_slots ts SET reservadas = reservadas + 1
+WHERE ts.id = :slot_id AND ts.activo AND ts.reservadas < ts.max_citas
+RETURNING ts.id;  -- vacío → slot lleno → ofrecer alternativas cercanas
+]]></sql_bloqueo>
+<transicion destino="confirmado" accion="INSERT citas(estado='confirmada') + outbox appointments.confirmed + recordatorios T-24h/T-2h"/>
+</estado>
+<estado nombre="confirmado" fase_final="true">
+<comportamiento>
+Resumen + folio + ETA/envío o fecha/hora cita + 'n' nuevo pedido (mantiene lang)
++ ticket PDF + QR autofactura como attachment
+</comportamiento>
+</estado>
+<estado nombre="handoff_humano">
+<flujo>
+Cola operador (tnotificaciones rol cajero/admin + webhook panel)
+· Ventana 24h Meta
+· Sin respuesta → reabrir bot con disculpa
+</flujo>
+<compliance>SIEMPRE identificar 'asistente automatizado' + opción escalar</compliance>
+</estado>
+</maquina_estados>
+
+<!-- ============ RAG PIPELINE 3 NIVELES ============ -->
+<rag_pipeline>
+<nivel1 name="FAQ-cache" cache="Redis TTL 1h" desc="respuestas_automaticas + kb: horarios, dirección, zonas, políticas — SIN LLM, ~0 costo">
+<codigo><![CDATA[
+async def rag_level1(redis, tenant_id: UUID, query: str):
+    cache_key = f"faq:{tenant_id}:{hashlib.sha256(query.encode()).hexdigest()[:16]}"
+    cached = await redis.get(cache_key)
+    if cached:
+        return json.loads(cached)
+    sql = """
+        SELECT respuesta FROM respuestas_automaticas
+        WHERE papeleria_id = :tid
+          AND activa = true
+          AND similarity(trigger_texto, :q) > 0.4
+        ORDER BY similarity(trigger_texto, :q) DESC
+        LIMIT 1
+    """
+    row = (await session.execute(text(sql), {"tid": str(tenant_id), "q": query})).first()
+    if row:
+        await redis.setex(cache_key, 3600, json.dumps({"respuesta": row[0]}))
+        return {"respuesta": row[0]}
+    return None
+]]></codigo>
+</nivel1>
+<nivel2 name="vectorial-pgvector">
+<sql><![CDATA[
+SELECT id, contenido_texto, metadata_json,
+       1 - (embedding <=> :query_vec) AS similitud
+FROM tiainteraccionesvector
+WHERE papeleria_id = :tenant_id
+  AND 1 - (embedding <=> :query_vec) >= 0.65
+ORDER BY embedding <=> :query_vec
+LIMIT 5;
+]]></sql>
+<indice>ivfflat cosine lists=100</indice>
+<embeddings_provider>openai:text-embedding-3-small 1536d</embeddings_provider>
+</nivel2>
+<nivel3 name="LLM-chain">
+<prompt><canon>
+Eres el asistente de {tenant_nombre}. Con este contexto: {top5}
+responde amable y breve en {lang}. NO inventes stock ni precios.
+Si no sabes, ofrece escalar a un asesor humano.
+</canon>
+</prompt>
+<guardrails>
+PII masking (wa_id→SHA-256) ANTES de LLM
+presupuesto tokens/tenant/mes (200k)
+circuit breaker → respuesta_template de ai_agent_reglas
+max_tokens=500, temperature=0.3
+</guardrails>
+<codigo_pipeline_completo><![CDATA[
+async def rag_respond(wa_id, query, ctx, db):
+    # Nivel 1: FAQ cache
+    cached = await rag_level1(redis, ctx['tenant'], query)
+    if cached:
+        return cached['respuesta']
+    # Nivel 2: vectorial
+    query_vec = await embed_query(query)
+    sql = text("""
+        SELECT contenido_texto, metadata_json
+        FROM tiainteraccionesvector
+        WHERE papeleria_id = :tid
+          AND 1 - (embedding <=> :qv) >= 0.65
+        ORDER BY embedding <=> :qv
+        LIMIT 5
+    """)
+    rows = (await db.execute(sql, {"tid": str(ctx['tenant']), "qv": query_vec})).fetchall()
+    contexto = [r[0] for r in rows]
+    # Nivel 3: LLM
+    if contexto:
+        prompt = f"""Eres el asistente de {ctx['tenant_nombre']}.
+Con este contexto: {contexto}
+Responde amable y breve en {ctx['lang']}. NO inventes stock ni precios.
+Si no sabes, ofrece escalar a un asesor humano.
+Pregunta del cliente: {query}"""
+        try:
+            respuesta = await llm_gateway.generate(
+                prompt=prompt,
+                max_tokens=500,
+                temperature=0.3,
+                task_type='customer_facing',
+                tenant_id=ctx['tenant'],
+            )
+            return respuesta
+        except Exception as e:
+            ctx['intentos_rag'] = ctx.get('intentos_rag', 0) + 1
+            if ctx['intentos_rag'] >= 2:
+                return plantilla_handoff(ctx['lang'])
+    # Fallback
+    ctx['intentos_rag'] = ctx.get('intentos_rag', 0) + 1
+    if ctx['intentos_rag'] >= 2:
+        return plantilla_handoff(ctx['lang'])
+    return plantilla_menu(ctx['lang'])
+]]></codigo_pipeline_completo>
+</nivel3>
+</rag_pipeline>
+
+<!-- ============ LLM GATEWAY (F14 routing explícito) ============ -->
+<llm_gateway archivo="src/application/services/llm_gateway.py">
+<codigo><![CDATA[
+# src/application/services/llm_gateway.py
+import hashlib, os, re
+from typing import Literal
+from uuid import UUID
+import structlog
+from sqlalchemy import func, select, text
+from sqlalchemy.ext.asyncio import AsyncSession
+from src.infrastructure.db.models import TLLMBudgetLog
+
+logger = structlog.get_logger(__name__)
+TaskType = Literal["interno_barato", "customer_facing", "largo_contexto", "tarea_critica"]
+
+COSTOS = {
+    "deepseek": {"input": 0.00014, "output": 0.00028},
+    "openai": {"input": 0.00015, "output": 0.00060},
+    "claude": {"input": 0.00300, "output": 0.01500},
+}
+PRESUPUESTO_MENSUAL_TOKENS = 200_000
+
+class LLMGatewayError(Exception):
+    pass
+
+class LLMGateway:
+    def __init__(self):
+        self.anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+        self.openai_key = os.getenv("OPENAI_API_KEY", "")
+        self.deepseek_key = os.getenv("DEEPSEEK_API_KEY", "")
+
+    def _enmascarar_pii(self, texto: str) -> str:
+        """Reemplaza wa_id (números) con hash para LFPDPPP."""
+        def _hash(match):
+            numero = match.group()
+            hash_corto = hashlib.sha256(numero.encode()).hexdigest()[:8]
+            return f"HASH_{hash_corto}"
+        return re.sub(r"\+?52\d{10}", _hash, texto)
+
+    async def _presupuesto_restante(self, session: AsyncSession, tenant_id: UUID) -> int:
+        mes_actual = __import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime("%Y-%m")
+        result = await session.execute(
+            select(func.coalesce(func.sum(TLLMBudgetLog.tokens_input + TLLMBudgetLog.tokens_output), 0))
+            .where(TLLMBudgetLog.papeleria_id == tenant_id, TLLMBudgetLog.mes == mes_actual)
+        )
+        consumidos = int(result.scalar() or 0)
+        return max(0, PRESUPUESTO_MENSUAL_TOKENS - consumidos)
+
+    def _elegir_proveedor(self, prompt: str, task_type: TaskType, presupuesto_restante: int) -> str:
+        if presupuesto_restante < PRESUPUESTO_MENSUAL_TOKENS * 0.2:
+            return "deepseek"
+        if task_type == "tarea_critica":
+            return "openai"
+        if len(prompt) > 32_000:
+            return "claude"
+        if task_type == "customer_facing":
+            return "openai"
+        if task_type == "largo_contexto":
+            return "claude"
+        return "deepseek"
+
+    async def generate(self, session, tenant_id, *, prompt, task_type="customer_facing",
+                       max_tokens=500, temperature=0.3) -> str:
+        prompt_seguro = self._enmascarar_pii(prompt)
+        presupuesto = await self._presupuesto_restante(session, tenant_id)
+        if presupuesto <= 0:
+            raise LLMGatewayError("Presupuesto LLM agotado")
+        proveedor = self._elegir_proveedor(prompt_seguro, task_type, presupuesto)
+        logger.info("llm.routing", proveedor=proveedor, task_type=task_type, presupuesto=presupuesto)
+        try:
+            if proveedor == "deepseek":
+                respuesta = await self._llamar_deepseek(prompt_seguro, max_tokens, temperature)
+            elif proveedor == "openai":
+                respuesta = await self._llamar_openai(prompt_seguro, max_tokens, temperature)
+            else:
+                respuesta = await self._llamar_claude(prompt_seguro, max_tokens, temperature)
+            tokens_in = len(prompt_seguro) // 4
+            tokens_out = len(respuesta) // 4
+            from decimal import Decimal
+            costo = Decimal(str(
+                (tokens_in / 1000) * COSTOS[proveedor]["input"]
+                + (tokens_out / 1000) * COSTOS[proveedor]["output"]
+            ))
+            session.add(TLLMBudgetLog(
+                papeleria_id=tenant_id, proveedor=proveedor, task_type=task_type,
+                tokens_input=tokens_in, tokens_output=tokens_out,
+                costo_usd=costo,
+                mes=__import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime("%Y-%m"),
+            ))
+            return respuesta
+        except Exception as e:
+            logger.error("llm.error", proveedor=proveedor, error=str(e)[:200])
+            for fb in ["openai", "deepseek"]:
+                if fb == proveedor: continue
+                try:
+                    if fb == "openai":
+                        return await self._llamar_openai(prompt_seguro, max_tokens, temperature)
+                    return await self._llamar_deepseek(prompt_seguro, max_tokens, temperature)
+                except Exception:
+                    continue
+            raise LLMGatewayError("Todos los proveedores fallaron")
+
+    async def _llamar_deepseek(self, prompt, max_tokens, temperature) -> str:
+        if not self.deepseek_key:
+            return f"[DEEPSEEK SIMULADO] {prompt[:80]}..."
+        import httpx
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                "https://api.deepseek.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {self.deepseek_key}"},
+                json={"model": "deepseek-chat", "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": max_tokens, "temperature": temperature},
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+
+    async def _llamar_openai(self, prompt, max_tokens, temperature) -> str:
+        if not self.openai_key:
+            return f"[OPENAI SIMULADO] {prompt[:80]}..."
+        import httpx
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {self.openai_key}"},
+                json={"model": "gpt-4o-mini", "messages": [{"role": "user", "content": prompt}],
+                      "max_tokens": max_tokens, "temperature": temperature},
+            )
+            r.raise_for_status()
+            return r.json()["choices"][0]["message"]["content"]
+
+    async def _llamar_claude(self, prompt, max_tokens, temperature) -> str:
+        if not self.anthropic_key:
+            return f"[CLAUDE SIMULADO] {prompt[:80]}..."
+        import httpx
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            r = await client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers={"x-api-key": self.anthropic_key, "anthropic-version": "2023-06-01"},
+                json={"model": "claude-3-5-sonnet-20241022", "max_tokens": max_tokens,
+                      "temperature": temperature, "messages": [{"role": "user", "content": prompt}]},
+            )
+            r.raise_for_status()
+            return r.json()["content"][0]["text"]
+
+llm_gateway = LLMGateway()
+]]></codigo>
+</llm_gateway>
+
+<!-- ============ IA LOOP — 5 AGENTES LANGGRAPH ============ -->
+<ia_loop orquestador="LangGraph" checkpointing="true" human_in_the_loop="true">
+<orquestador><codigo><![CDATA[
+# src/application/ia_loop/langgraph_orchestrator.py
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, Annotated
+import operator
+
+class AgentState(TypedDict):
+    messages: Annotated[list, operator.add]
+    tenant_id: str
+    event: dict
+    context: dict
+    next_agent: str
+    handoff_human: bool
+    trace_id: str
+
+def router(state: AgentState) -> str:
+    tipo = state['event'].get('eventType', '')
+    if tipo == 'whatsapp.inbound.received': return 'concierge'
+    if tipo.startswith('appointments'): return 'ventas_citas'
+    if tipo == 'inventory.stock.low.detected': return 'supply_chain'
+    if tipo == 'sale.completed': return 'marketing'
+    if tipo.startswith('payments'): return 'systems_integrator'
+    return END
+
+def build_graph():
+    try:
+        from langgraph.graph import StateGraph, END
+        from langgraph.checkpoint.postgres import PostgresSaver
+        graph = StateGraph(AgentState)
+        graph.add_node('concierge', concierge_agent)
+        graph.add_node('ventas_citas', ventas_citas_agent)
+        graph.add_node('supply_chain', supply_chain_agent)
+        graph.add_node('marketing', marketing_agent)
+        graph.add_node('systems_integrator', systems_integrator_agent)
+        graph.set_conditional_entry_point(router)
+        for node in ['concierge', 'ventas_citas', 'supply_chain',
+                     'marketing', 'systems_integrator']:
+            graph.add_edge(node, END)
+        checkpointer = PostgresSaver.from_conn_string(WORKER_DATABASE_URL)
+        return graph.compile(checkpointer=checkpointer)
+    except ImportError:
+        return None  # Fallback dispatcher simple
+]]></codigo>
+</orquestador>
+<agente id="1" nombre="Concierge Omnicanal" trigger="whatsapp.inbound.received">
+<codigo><![CDATA[
+# src/application/ia_loop/agents/concierge.py
+async def concierge_agent(state: AgentState) -> AgentState:
+    event = state['event']
+    payload = event.get('payload', {})
+    tenant_id = UUID(state['tenant_id'])
+    wa_id = payload.get('waId', '')
+    mensaje = payload.get('contenido', '')
+    # Clasificar intención (deepseek, barato)
+    intencion = await llm_gateway.generate(
+        session, tenant_id,
+        prompt=f"Clasifica esta intención: {mensaje}. Opciones: pedido, consulta, cita, queja, otro",
+        task_type='interno_barato',
+        max_tokens=20,
+    )
+    if intencion == 'pedido':
+        response = await handle_menu(wa_id, mensaje, ctx, db)
+    elif intencion == 'consulta':
+        response = await rag_respond(wa_id, mensaje, ctx, db)
+    elif intencion == 'cita':
+        ctx['estado'] = 'res_c'
+        response = "¡Claro! ¿Cuántas personas asistirán? (1, 2, o 3+)"
+    elif intencion == 'queja':
+        ctx['handoff'] = True
+        response = "Lamento escuchar eso. Te transfiero con un asesor humano."
+    else:
+        response = plantilla_menu(ctx['lang'])
+    await send_whatsapp(tenant_id, wa_id, response, es_automatico=True)
+    if ctx.get('handoff'):
+        await notify_human_handoff(tenant_id, wa_id)
+    state['context'] = ctx
+    state['handoff_human'] = ctx.get('handoff', False)
+    return state
+]]></codigo>
+</agente>
+<agente id="2" nombre="Gestor Ventas/Citas" trigger="appointments.*">
+<codigo><![CDATA[
+# src/application/ia_loop/agents/ventas_citas.py
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+
+async def ventas_citas_agent(state: AgentState) -> AgentState:
+    """F24: usa la clave zona_horaria del tenant, NO hardcodea America/Mexico_City."""
+    event = state['event']
+    payload = event['payload']
+    tenant_id = UUID(state['tenant_id'])
+    if event['eventType'] == 'appointment.booked':
+        # F24: leer zona_horaria de papeleria_configuracion (default America/Mexico_City)
+        tz = await get_config_value(db, tenant_id, "zona_horaria") or "America/Mexico_City"
+        creds = get_google_credentials(tenant_id)
+        service = build('calendar', 'v3', credentials=creds)
+        event_body = {
+            'summary': f"Cita PapelMind - {payload.get('motivo', 'Cita')}",
+            'start': {'dateTime': f"{payload['fecha']}T{payload['horaInicio']}:00", 'timeZone': tz},
+            'end':   {'dateTime': f"{payload['fecha']}T{payload['horaFin']}:00", 'timeZone': tz},
+        }
+        created = service.events().insert(calendarId='primary', body=event_body).execute()
+        await db.execute(text("UPDATE citas SET google_event_id = :geid WHERE id = :cid"),
+                         {"geid": created['id'], "cid": payload['citaId']})
+        await schedule_recordatorios(tenant_id, payload['citaId'])
+    elif event['eventType'] == 'appointment.cancelled':
+        await delete_google_event(tenant_id, payload.get('googleEventId'))
+    return state
+]]></codigo>
+</agente>
+<agente id="3" nombre="Supply Chain" trigger="inventory.stock.low.detected">
+<codigo><![CDATA[
+# src/application/ia_loop/agents/supply_chain.py
+from datetime import datetime
+
+async def supply_chain_agent(state: AgentState) -> AgentState:
+    event = state['event']
+    payload = event['payload']
+    tenant_id = UUID(state['tenant_id'])
+    articulo_id = UUID(payload['articuloId'])
+    sql_demanda = text("""
+        WITH demanda AS (
+            SELECT SUM(d.cantidad)/30.0 AS diaria, STDDEV_SAMP(d.cantidad) AS sigma
+            FROM tventas v JOIN tdetallesventa d ON d.venta_id = v.id
+            WHERE v.papeleria_id = :tid AND d.articulo_id = :aid
+              AND v.created_at > NOW() - INTERVAL '30 days'
+        )
+        SELECT diaria, COALESCE(sigma, 0) AS sigma FROM demanda
+    """)
+    row = (await db.execute(sql_demanda, {"tid": str(tenant_id), "aid": str(articulo_id)})).first()
+    if not row or not row.diaria: return state
+    lead_time = (await db.execute(text(
+        "SELECT MIN(lead_time_dias) FROM tproveedores WHERE papeleria_id = :tid AND activo = true"
+    ), {"tid": str(tenant_id)})).scalar() or 7
+    multiplicador = get_estacionalidad_multiplier()
+    punto_reorden = (row.diaria * lead_time + 1.65 * row.sigma * (lead_time ** 0.5)) * multiplicador
+    stock_actual = payload['stockDisponibleResultante']
+    if stock_actual <= punto_reorden:
+        proveedor_id = await get_best_proveedor(tenant_id, articulo_id)
+        cantidad_sugerida = max(punto_reorden * 2, 10)
+        orden = await crear_orden_compra(
+            tenant_id=tenant_id, proveedor_id=proveedor_id,
+            origen='urge_comprar',
+            items=[{'articulo_id': articulo_id, 'cantidad': cantidad_sugerida}],
+        )
+        await enqueue_event(db, tenant_id=tenant_id,
+            event_type='notifications.whatsapp.template',
+            aggregate_type='orden_compra', aggregate_id=orden.id,
+            payload={'numeroDestino': await get_admin_phone(tenant_id),
+                     'tipoContenido': 'template',
+                     'plantilla': {'nombre': 'orden_compra_borrador', 'idioma': 'es_MX'}})
+    return state
+
+def get_estacionalidad_multiplier() -> float:
+    mes = datetime.now().month
+    if mes in (7, 8, 1): return 1.8    # regreso a clases
+    if mes == 11: return 2.5           # black friday
+    if mes == 4: return 2.0            # día del niño
+    if mes == 5: return 1.5            # día de las madres
+    return 1.0
+]]></codigo>
+</agente>
+<agente id="4" nombre="Marketing Manager" trigger="sale.completed">
+<codigo><![CDATA[
+# src/application/ia_loop/agents/marketing.py
+async def marketing_agent(state: AgentState) -> AgentState:
+    event = state['event']
+    payload = event['payload']
+    tenant_id = UUID(state['tenant_id'])
+    cliente_rel_id = payload.get('clienteId')
+    if not cliente_rel_id: return state
+    sql = text("""
+        WITH cliente_rfm AS (
+            SELECT CURRENT_DATE - MAX(v.created_at::date) AS recencia,
+                   COUNT(*) AS frecuencia, SUM(v.total) AS monto
+            FROM tventas v
+            WHERE v.papeleria_id = :tid AND v.cliente_rel_id = :cid
+              AND v.estado = 'completada'
+        )
+        SELECT recencia, frecuencia, monto FROM cliente_rfm
+    """)
+    rfm = (await db.execute(sql, {"tid": str(tenant_id), "cid": str(cliente_rel_id)})).first()
+    segmento = classify_rfm_segment(rfm.recencia, rfm.frecuencia, rfm.monto)
+    await db.execute(text("""
+        INSERT INTO tsegmentosclientes (id, papeleria_id, cliente_rel_id, segmento, rfm_data, updated_at)
+        VALUES (generate_uuid_v7(), :tid, :cid, :seg, :rfm, NOW())
+        ON CONFLICT (papeleria_id, cliente_rel_id) DO UPDATE
+        SET segmento = :seg, rfm_data = :rfm, updated_at = NOW()
+    """), {"tid": str(tenant_id), "cid": str(cliente_rel_id), "seg": segmento,
+           "rfm": json.dumps({'r': rfm.recencia, 'f': rfm.frecuencia, 'm': float(rfm.monto)})})
+    return state
+
+def classify_rfm_segment(recencia, frecuencia, monto):
+    if recencia <= 30 and frecuencia >= 5 and monto >= 3000: return 'champion'
+    if recencia <= 60 and frecuencia >= 3: return 'loyal'
+    if recencia <= 90: return 'potential'
+    if recencia > 180: return 'at_risk'
+    return 'new'
+]]></codigo>
+</agente>
+<agente id="5" nombre="Systems Integrator" trigger="payments.webhook.processed">
+<codigo><![CDATA[
+# src/application/ia_loop/agents/systems_integrator.py
+async def systems_integrator_agent(state: AgentState) -> AgentState:
+    event = state['event']
+    payload = event['payload']
+    tenant_id = UUID(state['tenant_id'])
+    tipo = event.get('eventType', '')
+    if tipo == 'payment.rejected':
+        await enqueue_event(db, tenant_id=tenant_id,
+            event_type='notifications.whatsapp.text',
+            aggregate_type='pago', aggregate_id=payload['pagoId'],
+            payload={
+                'numeroDestino': await get_cliente_phone(tenant_id, payload['ventaId']),
+                'tipoContenido': 'text',
+                'texto': f"❌ Tu pago fue rechazado. Motivo: {payload.get('motivoRechazo', 'N/A')}. "
+                         f"Reintenta aquí: {FRONTEND_URL}/checkout/{payload['ventaId']}",
+            })
+    elif tipo == 'payment.refunded':
+        await crear_guia_devolucion(tenant_id, payload['ventaId'])
+        await registrar_reverso_contable(tenant_id, payload['pagoId'])
+    elif tipo == 'payment.approved' and payload.get('metodoPagoTipo') == 'SPEI':
+        await conciliar_spei(tenant_id, payload)
+    return state
+]]></codigo>
+</agente>
+<circuit_breakers>
+PAC: 5 fallos/60s → ABIERTO 30s → HALF-OPEN
+LLM: presupuesto agotado → plantillas
+TAE: timeout 15s × 3 → reversa automática
+</circuit_breakers>
+</ia_loop>
+</seccion_5_bot_ia>
+
+<!-- ============================================================================ -->
+<!-- SECCIÓN 6: CAPA FISCAL + LOGÍSTICA + EMPAQUE — F25 APLICADO                 -->
+<!-- ============================================================================ -->
+<seccion_6_fiscal_logistica fase="P1-P2">
+<!-- ============ FISCAL — PAC-FIRST ============ -->
+<fiscal>
+<estrategia canon="PAC-FIRST config-driven">
+<pac_primary default="SW_SMARTER" valores="SW_SMARTER|FACTURAMA|ECODEX|POCKET_CFDI|SW_SANDBOX"/>
+<pac_fallback default="FACTURAMA"/>
+<sat_directo estado="ELIMINADO como path API" nota="Solo contingencia manual documentada"/>
+<timeout>3000ms</timeout>
+<circuit_breaker>5 fallos/60s → ABIERTO 30s → HALF-OPEN</circuit_breaker>
+<retry_nocturno>dlq_replayer cada 6h × 3 intentos</retry_nocturno>
+</estrategia>
+
+<flujos>
+<flujo nombre="individual-directo">
+Datos fiscales checkout (invoice_data) o captura POS
+→ tfacturascfdi(solicitado) → outbox cfdi.requested
+→ worker: XML (claveProdServ/claveUnidad por línea + impuesto_id desglose IVA/IEPS)
+→ PAC → XML/PDF S3 → WhatsApp
+</flujo>
+<flujo nombre="autofactura QR">
+<endpoint metodo="POST" path="/api/v1/autofactura/token/{venta_id}" auth="cajero|admin">
+<codigo><![CDATA[
+import secrets
+from hashlib import sha256
+from fastapi import APIRouter, Depends, HTTPException
+from src.api.dependencies.auth import CurrentUserDep
+from src.infrastructure.db.unit_of_work import TenantUnitOfWork
+
+@router.post("/autofactura/token/{venta_id}")
+async def generar_token_autofactura(venta_id: UUID, user: CurrentUserDep):
+    async with TenantUnitOfWork(user.papeleria_id) as session:
+        venta = await session.get(TVenta, venta_id)
+        if not venta or venta.papeleria_id != user.papeleria_id:
+            raise HTTPException(404, "Venta no encontrada")
+        # Verificar que no esté facturada
+        existe = (await session.execute(select(TFacturaCFDI).where(
+            TFacturaCFDI.venta_id == venta_id, TFacturaCFDI.tipo == "individual"
+        ))).scalar_one_or_none()
+        if existe:
+            raise HTTPException(409, "Venta ya facturada")
+        token = secrets.token_urlsafe(32)
+        token_hash = sha256(token.encode()).hexdigest()
+        # Invalidar token previo si existe
+        existing_token = (await session.execute(select(TAutofacturaToken).where(
+            TAutofacturaToken.venta_id == venta_id
+        ))).scalar_one_or_none()
+        if existing_token:
+            await session.delete(existing_token)
+            await session.flush()
+        autofactura = TAutofacturaToken(
+            papeleria_id=user.papeleria_id, venta_id=venta_id,
+            token_hash=token_hash,
+            url_qr_autofactura=f"https://cfdi.papelmind.com/facturar?token={token}",
+            monto_limite_facturable=venta.total,
+            fecha_expiracion=datetime.now(timezone.utc) + timedelta(days=30),
+        )
+        session.add(autofactura)
+        await session.commit()
+        return {"token": token, "url_qr": autofactura.url_qr_autofactura,
+                "expira_en": autofactura.fecha_expiracion.isoformat()}
+]]></codigo>
+</endpoint>
+<endpoint metodo="POST" path="/api/v1/autofactura/solicitar" auth="NONE público" rol_db="erp_worker">
+<codigo><![CDATA[
+import hmac
+from hashlib import sha256
+from pydantic import BaseModel, Field
+
+class SolicitarFacturaRequest(BaseModel):
+    token: str = Field(..., min_length=10)
+    rfc_receptor: str = Field(..., pattern=r"^[A-ZÑ&amp;]{3,4}[0-9]{6}[A-Z0-9]{2}[A0]$")
+    nombre_receptor: str = Field(..., min_length=3, max_length=300)
+    cp_receptor: str = Field(..., pattern=r"^[0-9]{5}$")
+    regimen_fiscal_receptor: str = Field(..., pattern=r"^[0-9]{3}$")
+    uso_cfdi: str = Field(..., pattern=r"^(G01|G02|G03|S01|D01|P01)$")
+
+@router.post("/autofactura/solicitar")
+async def solicitar_autofactura(payload: SolicitarFacturaRequest,
+                                db: AsyncSession = Depends(get_worker_db)):
+    token_hash = sha256(payload.token.encode()).hexdigest()
+    autofactura = (await db.execute(select(TAutofacturaToken).where(
+        TAutofacturaToken.token_hash == token_hash
+    ))).scalar_one_or_none()
+    if not autofactura:
+        raise HTTPException(404, "Token inválido")
+    if autofactura.usado:
+        raise HTTPException(404, "Token ya usado")
+    if autofactura.fecha_expiracion < datetime.now(timezone.utc):
+        raise HTTPException(404, "Token expirado")
+    factura = TFacturaCFDI(
+        papeleria_id=autofactura.papeleria_id, venta_id=autofactura.venta_id,
+        tipo="individual", rfc_receptor=payload.rfc_receptor,
+        nombre_receptor=payload.nombre_receptor, cp_receptor=payload.cp_receptor,
+        regimen_fiscal_receptor=payload.regimen_fiscal_receptor,
+        uso_cfdi=payload.uso_cfdi, estado_cfdi="solicitado",
+    )
+    db.add(factura)
+    autofactura.usado = True
+    autofactura.usado_en = datetime.now(timezone.utc)
+    await enqueue_event(db, tenant_id=autofactura.papeleria_id,
+        event_type="cfdi.requested", aggregate_type="factura", aggregate_id=str(factura.id),
+        payload={"facturaId": str(factura.id), "tipo": "individual",
+                 "ventaId": str(factura.venta_id),
+                 "rfcReceptor": payload.rfc_receptor,
+                 "nombreReceptor": payload.nombre_receptor,
+                 "cpReceptor": payload.cp_receptor,
+                 "regimenFiscalReceptor": payload.regimen_fiscal_receptor,
+                 "usoCfdi": payload.uso_cfdi})
+    await db.commit()
+    return {"status": "Factura en cola para timbrado", "factura_id": str(factura.id)}
+]]></codigo>
+</endpoint>
+</flujo>
+<flujo nombre="global-nocturno">
+Job diario 23:59 → SELECT ventas sin CFDI del día
+→ INSERT tfacturascfdi(tipo='global', venta_id=NULL, periodo_desde/hasta, ventas_globales_ids JSONB, rfc='XAXX010101000', uso_cfdi='S01')
+→ outbox cfdi.requested → Mismo worker, mismo DLQ
+</flujo>
+</flujos>
+
+<cfdi_service fix="F25"><![CDATA[
+# src/application/services/cfdi_service.py
+import base64
+from datetime import datetime, timezone
+from decimal import Decimal
+
+def _impuestos_totales(detalles) -> tuple[str, str]:
+    """F25: Agrega traslados por (Impuesto, TasaOCuota) DESDE las líneas — SAT exige
+    agrupar; con IEPS/exento la constante 0.16 generaba XML inválido."""
+    grupos: dict[tuple[str, str], list[Decimal]] = {}
+    for d in detalles:
+        if d.impuesto.tipo == "iva":
+            key = ("002", f"{d.impuesto.tasa:.6f}")
+            grupos.setdefault(key, [Decimal("0"), Decimal("0")])
+            grupos[key][0] += d.importe_base
+            grupos[key][1] += d.importe_iva
+        elif d.impuesto.tipo == "ieps":
+            key = ("003", f"{d.impuesto.tasa:.6f}")
+            grupos.setdefault(key, [Decimal("0"), Decimal("0")])
+            grupos[key][0] += d.importe_base
+            grupos[key][1] += d.importe_ieps
+        # exento: sin traslado (ObjetoImp y exención por línea)
+    traslados = "".join(
+        f'<cfdi:Traslado Base="{base:.2f}" Impuesto="{imp}" '
+        f'TipoFactor="Tasa" TasaOCuota="{tasa}" Importe="{importe:.2f}"/>'
+        for (imp, tasa), (base, importe) in sorted(grupos.items()))
+    total = sum(v[1] for v in grupos.values())
+    return traslados, f"{total:.2f}"
+
+async def construir_xml_cfdi(factura: TFacturaCFDI, detalles: list) -> str:
+    """Construye XML CFDI 4.0 con impuestos por LÍNEA."""
+    emisor = factura.papeleria
+    regimen = emisor.sat_empresa_config.regimen_fiscal
+    cp_emisor = emisor.sat_empresa_config.cp_emisor
+    conceptos_xml = []
+    for d in detalles:
+        traslados = []
+        if d.impuesto.tipo == 'iva':
+            traslados.append(f'''<cfdi:Traslado Base="{d.importe_base}" Impuesto="002"
+                TipoFactor="Tasa" TasaOCuota="{d.impuesto.tasa}" Importe="{d.importe_iva}" />''')
+        elif d.impuesto.tipo == 'ieps':
+            traslados.append(f'''<cfdi:Traslado Base="{d.importe_base}" Impuesto="003"
+                TipoFactor="Tasa" TasaOCuota="{d.impuesto.tasa}" Importe="{d.importe_ieps}" />''')
+        conceptos_xml.append(f'''<cfdi:Concepto ClaveProdServ="{d.clave_prod_serv}"
+            Cantidad="{d.cantidad}" ClaveUnidad="{d.clave_unidad}"
+            Descripcion="{d.descripcion}" ValorUnitario="{d.precio_unitario}"
+            Importe="{d.subtotal}" ObjetoImp="02">
+            <cfdi:Impuestos><cfdi:Traslados>{"".join(traslados)}</cfdi:Traslados></cfdi:Impuestos>
+            </cfdi:Concepto>''')
+    # F25: totales agregados DESDE las líneas (nunca constante TasaOCuota="0.160000")
+    traslados_totales, total_impuestos = _impuestos_totales(detalles)
+    xml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<cfdi:Comprobante xmlns:cfdi="http://www.sat.gob.mx/cfd/4"
+    Version="4.0" Serie="{factura.serie or 'A'}" Folio="{factura.folio}"
+    Fecha="{datetime.now(timezone.utc).isoformat()}"
+    FormaPago="01" MetodoPago="PUE" Moneda="MXN"
+    SubTotal="{factura.subtotal}" Total="{factura.monto_total}"
+    TipoDeComprobante="I" Exportacion="01" LugarExpedicion="{cp_emisor}">
+    <cfdi:Emisor Rfc="{emisor.rfc_emisor}" Nombre="{emisor.razon_social}"
+        RegimenFiscal="{regimen}" />
+    <cfdi:Receptor Rfc="{factura.rfc_receptor}" Nombre="{factura.nombre_receptor}"
+        DomicilioFiscalReceptor="{factura.cp_receptor}"
+        RegimenFiscalReceptor="{factura.regimen_fiscal_receptor}"
+        UsoCFDI="{factura.uso_cfdi}" />
+    <cfdi:Conceptos>{"".join(conceptos_xml)}</cfdi:Conceptos>
+    <cfdi:Impuestos TotalImpuestosTrasladados="{total_impuestos}">
+        <cfdi:Traslados>{traslados_totales}</cfdi:Traslados>
+    </cfdi:Impuestos>
+</cfdi:Comprobante>'''
+    return xml
+]]></cfdi_service>
+
+<cumplimiento>
+CFDI 4.0 complementos · Carta porte si aplica
+· LFPDPPP (ARCO, aviso, PII masking LLM, cifrado)
+· PROFECO (precios/T&amp;C/devoluciones visibles)
+· WhatsApp Business opt-in/plantillas/escalar humano
+· PCI: NO PAN storage
+· IMPI PapelMind + defensiva PaperMind (clases 9/35/39/42)
+· Retención fiscal CFDI 5+ años
+</cumplimiento>
+</fiscal>
+
+<!-- ============ LOGÍSTICA — 8 COURIERS ============ -->
+<logistica>
+<courier_hub><codigo><![CDATA[
+# src/application/services/courier_hub.py
+import asyncio
+from abc import ABC, abstractmethod
+from decimal import Decimal
+from typing import Optional
+from uuid import UUID
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+class CourierError(Exception):
+    pass
+
+class CourierProvider(ABC):
+    @abstractmethod
+    async def cotizar(self, origen: dict, destino: dict, peso: float) -> dict: ...
+    @abstractmethod
+    async def crear_orden(self, envio) -> dict: ...
+    @abstractmethod
+    async def cancelar(self, tracking_id: str) -> bool: ...
+
+class CourierHub:
+    def __init__(self):
+        self.providers: dict[str, CourierProvider] = {
+            'UBER_DIRECT': UberDirectClient(),
+            'DIDI': DidiClient(),
+            'INDRIVER': InDriverClient(),
+            'MOTOTAXI_SEGURO': MototaxiClient(),
+            'RAPPI': RappiClient(),
+            'AMAZON_LOGISTICS': AmazonLogisticsClient(),
+            'ESTAFETA': EstafetaClient(),
+            'DHL_STANDARD': DHLClient(mode='standard'),
+            'DHL_EXPRESS': DHLClient(mode='express'),
+        }
+
+    async def cotizar_todos(self, session, tenant_id: UUID,
+                            origen: dict, destino: dict, peso_kg: Decimal) -> list[dict]:
+        """Cotiza en paralelo todos los couriers activos."""
+        couriers = (await session.execute(
+            select(TCourier).where(TCourier.papeleria_id == tenant_id, TCourier.activo.is_(True))
+            .order_by(TCourier.prioridad.asc())
+        )).scalars().all()
+        tasks = [self._cotizar_uno(session, tenant_id, c, origen, destino, peso_kg) for c in couriers]
+        resultados = await asyncio.gather(*tasks, return_exceptions=True)
+        cotizaciones = []
+        for c, result in zip(couriers, resultados):
+            if isinstance(result, Exception):
+                session.add(TCotizacionCourier(
+                    papeleria_id=tenant_id, courier_codigo=c.codigo,
+                    fee=Decimal("0"), exitoso=False, error_mensaje=str(result)[:200]))
+                continue
+            if result:
+                cotizaciones.append({
+                    "courier_codigo": c.codigo, "courier_nombre": c.nombre,
+                    "fee": result["fee"], "eta_minutos": result["eta_minutos"],
+                    "eta_texto": result["eta_texto"],
+                })
+                session.add(TCotizacionCourier(
+                    papeleria_id=tenant_id, courier_codigo=c.codigo,
+                    fee=result["fee"], eta_minutos=result["eta_minutos"], exitoso=True))
+        cotizaciones.sort(key=lambda x: x["fee"])
+        return cotizaciones
+
+    async def _cotizar_uno(self, session, tenant_id: UUID, courier,
+                           origen: dict, destino: dict, peso_kg: Decimal) -> Optional[dict]:
+        try:
+            if courier.codigo == "FLOTA_INTERNA":
+                return await self._cotizar_flota_interna(tenant_id, origen, destino, peso_kg)
+            elif courier.codigo == "UBER_DIRECT":
+                return await self._cotizar_uber_direct(tenant_id, origen, destino)
+            elif courier.codigo == "DIDI":
+                return await self._cotizar_didi(tenant_id, origen, destino)
+            elif courier.codigo == "INDRIVER":
+                return {"fee": 55.00, "eta_minutos": 45, "eta_texto": "45 min"}
+            elif courier.codigo == "MOTOTAXI_SEGURO":
+                return {"fee": 50.00, "eta_minutos": 40, "eta_texto": "40 min"}
+            elif courier.codigo in ("AMAZON_LOGISTICS", "ESTAFETA", "DHL_STANDARD"):
+                return await self._cotizar_nacional(courier.codigo, peso_kg)
+            return None
+        except Exception as e:
+            logger.warning("courier.cotizacion_fallida", courier=courier.codigo, error=str(e)[:100])
+            raise
+
+    async def _cotizar_flota_interna(self, tenant_id, origen, destino, peso_kg) -> dict:
+        base = Decimal("40.00")
+        por_kg = Decimal("5.00")
+        distancia = self._haversine(origen.get("lat"), origen.get("lng"),
+                                    destino.get("lat"), destino.get("lng"))
+        fee = base + (peso_kg * por_kg) + (Decimal(str(distancia)) * Decimal("2.00"))
+        eta_min = int((distancia * 3) + 20)
+        return {"fee": float(round(fee, 2)), "eta_minutos": eta_min,
+                "eta_texto": f"{eta_min} min" if eta_min < 60 else f"{eta_min // 60}h {eta_min % 60}m"}
+
+    async def _cotizar_uber_direct(self, tenant_id, origen, destino) -> dict:
+        distancia = self._haversine(origen.get("lat"), origen.get("lng"),
+                                    destino.get("lat"), destino.get("lng"))
+        fee = Decimal("75.00") + (Decimal(str(distancia)) * Decimal("8.00"))
+        eta_min = int(distancia * 2.5) + 15
+        return {"fee": float(round(fee, 2)), "eta_minutos": eta_min, "eta_texto": f"{eta_min} min"}
+
+    async def _cotizar_didi(self, tenant_id, origen, destino) -> dict:
+        distancia = self._haversine(origen.get("lat", 0), origen.get("lng", 0),
+                                    destino.get("lat", 0), destino.get("lng", 0))
+        fee = Decimal("65.00") + (Decimal(str(distancia)) * Decimal("7.50"))
+        eta_min = int(distancia * 3) + 20
+        return {"fee": float(round(fee, 2)), "eta_minutos": eta_min, "eta_texto": f"{eta_min} min"}
+
+    async def _cotizar_nacional(self, courier_codigo: str, peso_kg: Decimal) -> dict:
+        tarifas = {"AMAZON_LOGISTICS": Decimal("120.00"),
+                   "ESTAFETA": Decimal("100.00"),
+                   "DHL_STANDARD": Decimal("150.00")}
+        base = tarifas.get(courier_codigo, Decimal("100.00"))
+        extra_peso = max(Decimal("0"), (peso_kg - Decimal("5")) * Decimal("15.00"))
+        return {"fee": float(base + extra_peso), "eta_minutos": 4320, "eta_texto": "3-5 días"}
+
+    @staticmethod
+    def _haversine(lat1, lng1, lat2, lng2) -> float:
+        import math
+        if not all([lat1, lng1, lat2, lng2]):
+            return 5.0
+        R = 6371
+        dlat = math.radians(lat2 - lat1)
+        dlng = math.radians(lng2 - lng1)
+        a = math.sin(dlat / 2) ** 2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlng / 2) ** 2
+        c = 2 * math.asin(math.sqrt(a))
+        return round(R * c, 2)
+]]></codigo>
+</courier_hub>
+
+<empaque canon="P1">
+<politica_peso valores="advertencia(default) | bloqueante(alto valor/express) | desactivado"
+config="papeleria_configuracion.peso_validacion"/>
+<verificacion>
+Escaneo 100% SKUs (WebHID Enter)
+· báscula WebSerial ±5% INDICADOR según política
+· excepciones → tincidenciasdespacho
+</verificacion>
+<impresion_pdf><codigo><![CDATA[
+# src/application/services/nota_entrega_service.py
+from fpdf import FPDF
+import qrcode
+from io import BytesIO
+
+class NotaEntregaPDF(FPDF):
+    def __init__(self, envio, venta, cliente):
+        super().__init__(format='LETTER')
+        self.envio = envio
+        self.venta = venta
+        self.cliente = cliente
+
+    def header(self):
+        self.set_font('Helvetica', 'B', 14)
+        self.cell(0, 10, 'NOTA DE ENTREGA — PapelMind', ln=1, align='C')
+        self.set_font('Helvetica', '', 9)
+        self.cell(0, 6, f'Folio: {self.venta.folio}', ln=1)
+        self.cell(0, 6, f'Fecha: {self.envio.created_at.strftime("%d/%m/%Y %H:%M")}', ln=1)
+        self.ln(4)
+
+    def body(self):
+        self.set_font('Helvetica', 'B', 11)
+        self.cell(0, 8, 'ENTREGAR A:', ln=1)
+        self.set_font('Helvetica', '', 10)
+        self.multi_cell(0, 5, f'{self.cliente.display_name}\n'
+                              f'{self.envio.direccion.calle_numero}\n'
+                              f'Col. {self.envio.direccion.colonia}\n'
+                              f'CP {self.envio.direccion.codigo_postal}\n'
+                              f'Ref: {self.envio.direccion.referencias or "N/A"}')
+        self.ln(6)
+        self.set_font('Helvetica', 'B', 11)
+        self.cell(0, 8, 'PRODUCTOS:', ln=1)
+        self.set_font('Helvetica', '', 10)
+        for item in self.venta.detalles:
+            self.cell(0, 6, f'• {item.cantidad} x {item.articulo.descripcion}', ln=1)
+        self.ln(6)
+        # QR tracking
+        qr = qrcode.make(f'https://dispatch.papelmind.com/tracking/{self.envio.qr_token}')
+        buf = BytesIO()
+        qr.save(buf, format='PNG')
+        self.image(buf, x=150, y=100, w=40)
+        # Firma
+        self.set_y(-40)
+        self.set_font('Helvetica', '', 9)
+        self.cell(80, 6, '_____', ln=0)
+        self.cell(80, 6, '_____', ln=1)
+        self.cell(80, 6, 'Firma recibido', ln=0)
+        self.cell(80, 6, 'Nombre y fecha', ln=1)
+
+    def generar(self) -> bytes:
+        self.add_page()
+        self.header()
+        self.body()
+        return bytes(self.output())
+]]></codigo>
+</impresion_pdf>
+<nota>ZPL 4x6 ADAPTADOR OPCIONAL (print_mode)</nota>
+</impresion_pdf>
+<torre_control>
+KPIs paquetes/hora · tiempo medio empaque &lt;50s meta
+· incidencias por turno · salud periféricos · Outbound manifiestos
+</torre_control>
+</empaque>
+
+<estados_fulfillment>
+venta: pendiente_pago → pagada → en_preparacion → empacada → despachada → completada
+· envío: creado → asignado → en_camino → entregado | fallido | cancelado
+</estados_fulfillment>
+</logistica>
+</seccion_6_fiscal_logistica>
+
+<!-- ============================================================================ -->
+<!-- SECCIÓN 7: CONTRATOS DE EVENTOS (18 TOPICS) + 9 WORKERS — F17 APLICADO      -->
+<!-- ============================================================================ -->
+<seccion_7_contratos_workers fase="P0-P2">
+<envelope_canon>
+<estructura>
+{eventId: outbox.id, tenantId, eventType, timestamp, version:"1.0", traceId (propagado F7), payload}
+</estructura>
+<validacion>contracts/events/{topic}.json + jsonschema ANTES de publicar. Fallo validación → intentos+1 (no publicar corrupto)</validacion>
+<particionado>key=tenantId → orden garantizado POR TENANT · 6 particiones default (dev KRaft 1 · prod 6-12)</particionado>
+<versionado_schemas>Breaking → topic .v2 + dual-publish 30d · Non-breaking → mismo topic, bump version envelope</versionado_schemas>
+</envelope_canon>
+
+<consumer_groups>
+<grupo nombre="outbox_publisher" miembros="outbox_worker" entrega="at-least-once + idempotencia eventId"/>
+<grupo nombre="loyalty_group" anti_dup="NOT EXISTS tmovimientospuntos"/>
+<grupo nombre="cfdi_group" anti_dup="estado_cfdi='solicitado' re-selección"/>
+<grupo nombre="notification_group" anti_dup="tmensajes.mensaje_externo_id"/>
+<grupo nombre="ia_loop_group" miembros="ia_loop_worker (5 sub-agentes LangGraph)"/>
+<grupo nombre="dlq_group" miembros="dlq_consumer (v2.1.2)"/>
+<regla>NUNCA dos workers distintos en el mismo consumer group sobre el mismo topic salvo réplicas del MISMO worker</regla>
+</consumer_groups>
+
+<politica_dlq>
+<tabla>
+<fila intento="1" delay="inmediato" accion="reintento"/>
+<fila intento="2" delay="+5s" accion="reintento backoff"/>
+<fila intento="3" delay="+30s" accion="reintento final"/>
+<fila intento=">3" accion="TERMINAL: NO re-seleccionar (WHERE intentos&lt;3) + PUBLICAR a dlq.events + tdlq_eventos vía dlq_consumer + métrica erp_outbox_dlq_total + alerta"/>
+</tabla>
+<reproceso>Dashboard admin (replay individual / batch F8 límite 1000 + confirm=true / descartar con motivo) → intentos=0, procesado=false</reproceso>
+<job_nocturno>dlq_replayer cada 6h re-intenta (ventana calma proveedores caídos: PAC/SAT)</job_nocturno>
+<topic_infra nombre="dlq.events" particiones="3" retencion="30d" payload="{eventId original, topicOriginal, eventType, tenantId, error, intentos, firstFailedAt}"/>
+</politica_dlq>
+
+<!-- ============ 18 TOPICS (schemas completos) ============ -->
+<contratos_eventos>
+<topic canon="sales.order.completed" alias_es="ventas.facturadas" fase="P0">
+<proposito>Venta completada (POS/e-commerce/WhatsApp/kiosco)</proposito>
+<schema><![CDATA[
+{"$schema":"http://json-schema.org/draft-07/schema#",
+"$id":"https://schema.papelmind.com/events/sales.order.completed.json",
+"type":"object","required":["eventId","tenantId","eventType","timestamp","payload"],
+"properties":{
+"eventId":{"type":"string","format":"uuid"},
+"tenantId":{"type":"string","format":"uuid"},
+"eventType":{"enum":["sale.completed","layaway.created"]},
+"timestamp":{"type":"string","format":"date-time"},
+"version":{"const":"1.0"},"traceId":{"type":"string","maxLength":64},
+"payload":{"type":"object","required":["ventaId","folio","clientUuid","metodoPago","origen","subtotal","total","items"],
+"properties":{
+"ventaId":{"format":"uuid"},"folio":{"maxLength":30},"clientUuid":{"format":"uuid"},
+"clienteId":{"format":"uuid"},"operarioId":{"format":"uuid"},"cajaId":{"format":"uuid"},
+"sucursalId":{"format":"uuid"},"estacionId":{"format":"uuid"},
+"metodoPago":{"enum":["efectivo","tarjeta_debito","tarjeta_credito","transferencia","spei","mercado_pago","openpay","puntos","mixto","credito"]},
+"origen":{"enum":["pos","rompefila","ecommerce","whatsapp","kiosco"]},
+"moneda":{"pattern":"^[A-Z]{3}$"},
+"subtotal":{"minimum":0},"impuestos":{"minimum":0},"descuentoTotal":{"minimum":0},"total":{"minimum":0},
+"items":{"type":"array","minItems":1,"items":{"required":["detalleId","articuloId","cantidad","precioUnitario","subtotal"],
+"properties":{"detalleId":{"format":"uuid"},"articuloId":{"format":"uuid"},"loteId":{"format":"uuid"},"sku":{},
+"cantidad":{"exclusiveMinimum":0},"precioUnitario":{"minimum":0},"descuento":{"minimum":0},"subtotal":{"minimum":0},
+"impuesto":{"properties":{"tipo":{"enum":["iva","ieps","exento"]},"tasa":{},"monto":{}}}}}},
+"esAparado":{"default":false},
+"aparado":{"properties":{"aparadoId":{"format":"uuid"},"enganche":{"minimum":0},"saldoPendiente":{"minimum":0},"fechaVencimiento":{"format":"date"}},"required":["enganche","saldoPendiente","fechaVencimiento"]},
+"entrega":{"properties":{"tipo":{"enum":["tienda","envio_express","recoge_en_tienda"]},"direccionId":{"format":"uuid"},
+"proveedorLogistica":{},"trackingId":{},"costoEnvio":{"minimum":0},"eta":{"format":"date-time"}}}}}}
+]]></schema>
+<consumidores>loyalty_worker · notification_worker · analytics_correlator(P2)</consumidores>
+</topic>
+<topic canon="inventory.stock.changed" alias_es="inventario.stock.actualizado" fase="P0">
+<proposito>Stock cambia por transacción</proposito>
+<schema><![CDATA[
+{"$id":"https://schema.papelmind.com/events/inventory.stock.changed.json",
+"type":"object","required":["eventId","tenantId","eventType","timestamp","payload"],
+"properties":{
+"eventId":{"format":"uuid"},"tenantId":{"format":"uuid"},
+"eventType":{"enum":["stock.reserved","stock.deducted","stock.released","stock.adjusted","stock.low.detected"]},
+"timestamp":{"format":"date-time"},"version":{"const":"1.0"},"traceId":{"maxLength":64},
+"payload":{"required":["articuloId","sucursalId","cantidadAfectada","stockDisponibleResultante"],
+"properties":{
+"articuloId":{"format":"uuid"},"loteId":{"format":"uuid"},"sucursalId":{"format":"uuid"},"sku":{},
+"numeroLote":{},"fechaVencimiento":{"format":"date"},
+"cantidadAfectada":{"exclusiveMinimum":0},
+"stockDisponibleResultante":{"minimum":0},"stockReservadoResultante":{"minimum":0},"stockTotalResultante":{"minimum":0},
+"esVencido":{"default":false},"estaEnMinimo":{"default":false},
+"referencia":{},"ventaId":{"format":"uuid"},"operarioId":{"format":"uuid"},
+"faltante":{"minimum":0},"prioridad":{"enum":["critico","urgente","normal"]}}}}
+]]></schema>
+<consumidores>inventory_alert_worker · ia_loop_worker (Supply) · whatsapp alerta restock</consumidores>
+</topic>
+<topic canon="fiscal.cfdi.requested" alias_es="fiscal.cfdi.solicitado" fase="P0">
+<proposito>Timbrado CFDI 4.0 vía PAC-First</proposito>
+<schema><![CDATA[
+{"$id":"https://schema.papelmind.com/events/fiscal.cfdi.requested.json",
+"type":"object","required":["eventId","tenantId","eventType","timestamp","payload"],
+"properties":{
+"eventId":{"format":"uuid"},"tenantId":{"format":"uuid"},
+"eventType":{"const":"cfdi.requested"},
+"timestamp":{"format":"date-time"},"version":{"const":"1.0"},"traceId":{"maxLength":64},
+"payload":{"required":["facturaId","tipo","rfcReceptor","nombreReceptor","cpReceptor","regimenFiscalReceptor","usoCfdi","montoTotal","items"],
+"properties":{
+"facturaId":{"format":"uuid"},
+"tipo":{"enum":["individual","global"]},
+"ventaId":{"format":"uuid"},"periodoDesde":{"format":"date"},"periodoHasta":{"format":"date"},
+"ventasGlobalesIds":{"type":"array","items":{"format":"uuid"}},
+"rfcReceptor":{"pattern":"^[A-Z&amp;Ñ]{3,4}[0-9]{6}[A-V1-9][A-Z1-9][0-9A]$"},
+"nombreReceptor":{"maxLength":300},"cpReceptor":{"pattern":"^[0-9]{5}$"},
+"regimenFiscalReceptor":{"pattern":"^[0-9]{3}$"},
+"usoCfdi":{"enum":["G01","G02","G03","S01","D01","P01"]},
+"montoTotal":{"minimum":0},"subtotal":{"minimum":0},"impuestos":{"minimum":0},
+"items":{"type":"array","minItems":1,"items":{"required":["claveProdServ","claveUnidad","descripcion","cantidad","valorUnitario","importe"],
+"properties":{"claveProdServ":{},"claveUnidad":{},"descripcion":{},"cantidad":{},"valorUnitario":{},"importe":{},
+"impuesto":{"properties":{"tipo":{"enum":["iva","ieps","exento"]},"tasa":{}}}}}}}}}}
+]]></schema>
+<consumidores>cfdi_worker (PAC-First + circuit breaker)</consumidores>
+</topic>
+<topic canon="crm.loyalty.points.moved" alias_es="crm.fidelizacion.puntos" fase="P0">
+<proposito>Acumulación/redención/cambio de nivel Tarjeta Consentido</proposito>
+<schema><![CDATA[
+{"$id":"https://schema.papelmind.com/events/crm.loyalty.points.moved.json",
+"type":"object","required":["eventId","tenantId","eventType","timestamp","payload"],
+"properties":{
+"eventId":{"format":"uuid"},"tenantId":{"format":"uuid"},
+"eventType":{"enum":["loyalty.points.accumulated","loyalty.points.redeemed","loyalty.level.changed"]},
+"timestamp":{"format":"date-time"},"version":{"const":"1.0"},"traceId":{},
+"payload":{"required":["tarjetaId","clienteId","puntosMovimiento","saldoPuntosResultante"],
+"properties":{
+"tarjetaId":{"format":"uuid"},"clienteId":{"format":"uuid"},"ventaId":{"format":"uuid"},
+"tipoMovimiento":{"enum":["acumulacion","redencion"]},
+"puntosMovimiento":{"exclusiveMinimum":0},
+"saldoPuntosAnterior":{"minimum":0},"saldoPuntosResultante":{"minimum":0},
+"nivelAnterior":{"enum":["bronce","plata","oro","platino"]},
+"nivelResultante":{"enum":["bronce","plata","oro","platino"]},
+"montoCompra":{"minimum":0}}}}
+]]></schema>
+<consumidores>notification_worker (WhatsApp felicitación nivel + beneficio)</consumidores>
+</topic>
+<topic canon="notifications.whatsapp.send" alias_es="notificaciones.whatsapp.enviar" fase="P0">
+<proposito>Salida WhatsApp (plantilla/texto/interactivo)</proposito>
+<schema><![CDATA[
+{"$id":"https://schema.papelmind.com/events/notifications.whatsapp.send.json",
+"type":"object","required":["eventId","tenantId","eventType","timestamp","payload"],
+"properties":{
+"eventId":{"format":"uuid"},"tenantId":{"format":"uuid"},
+"eventType":{"enum":["whatsapp.template","whatsapp.text","whatsapp.interactive"]},
+"timestamp":{"format":"date-time"},"version":{"const":"1.0"},"traceId":{},
+"payload":{"required":["numeroDestino","tipoContenido"],
+"properties":{
+"numeroDestino":{"pattern":"^\\+[1-9]\\d{1,14}$"},
+"tipoContenido":{"enum":["template","text","interactive"]},
+"plantilla":{"required":["nombre"],"properties":{"nombre":{},"idioma":{"default":"es_MX"},"componentes":{"type":"array"}}},
+"texto":{"maxLength":4096},"interactivo":{"type":"object"},
+"metadatos":{"properties":{"ventaId":{"format":"uuid"},"aparadoId":{"format":"uuid"},"citaId":{"format":"uuid"},
+"ticketUrl":{},"facturaUrl":{},"trackingUrl":{}}},
+"prioridad":{"type":"integer","minimum":0,"maximum":3,"default":1}}}}
+]]></schema>
+<consumidores>notification_worker (Meta Cloud API)</consumidores>
+</topic>
+<topic canon="logistics.shipment.updated" alias_es="logistica.envio.actualizado" fase="P1">
+<schema><![CDATA[
+{"$id":"https://schema.papelmind.com/events/logistics.shipment.updated.json",
+"type":"object","required":["eventId","tenantId","eventType","timestamp","payload"],
+"properties":{
+"eventId":{"format":"uuid"},"tenantId":{"format":"uuid"},
+"eventType":{"enum":["shipment.created","shipment.assigned","shipment.in_transit","shipment.delivered","shipment.failed"]},
+"timestamp":{"format":"date-time"},"version":{"const":"1.0"},"traceId":{},
+"payload":{"required":["envioId","ventaId","estado"],
+"properties":{
+"envioId":{"format":"uuid"},"ventaId":{"format":"uuid"},"clienteId":{"format":"uuid"},
+"proveedorLogistica":{"enum":["FLOTA_INTERNA","UBER_DIRECT","DIDI","INDRIVER","MOTOTAXI_SEGURO","RAPPI","AMAZON_LOGISTICS","ESTAFETA","DHL_STANDARD","DHL_EXPRESS"]},
+"trackingId":{},"estado":{"enum":["creado","asignado","en_camino","entregado","fallido","cancelado"]},
+"ubicacionActual":{"properties":{"latitud":{},"longitud":{},"direccion":{}}},
+"eta":{"format":"date-time"},"fechaEntregaReal":{"format":"date-time"},
+"motivoFalla":{},"repartidor":{"type":"object"},"historial":{"type":"array"}}}}
+]]></schema>
+<consumidores>notification_worker (tracking WhatsApp)</consumidores>
+</topic>
+<topic canon="payments.webhook.processed" fase="P1">
+<schema><![CDATA[
+{"$id":"https://schema.papelmind.com/events/payments.webhook.processed.json",
+"type":"object","required":["eventId","tenantId","eventType","timestamp","payload"],
+"properties":{
+"eventId":{"format":"uuid"},"tenantId":{"format":"uuid"},
+"eventType":{"enum":["payment.approved","payment.rejected","payment.refunded","payment.duplicate","payment.orphan"]},
+"timestamp":{"format":"date-time"},"version":{"const":"1.0"},"traceId":{"maxLength":64},
+"payload":{"required":["pagoId","pasarela","idExterno","monto","estado"],
+"properties":{
+"pagoId":{"format":"uuid"},"ventaId":{"format":"uuid"},
+"pasarela":{"enum":["MERCADOPAGO","OPENPAY","SPEI","OTRO"]},
+"idExterno":{"description":"provider_event_id idempotencia"},
+"referenciaPago":{},"metodoPagoTipo":{"enum":["TARJETA","SPEI","OXXO_PAY","MERCADOPAGO_WALLET"]},
+"msi":{"enum":[1,3,6,9,12]},"monto":{"minimum":0},"moneda":{"pattern":"^[A-Z]{3}$"},
+"estado":{"enum":["approved","rejected","refunded","pending"]},
+"motivoRechazo":{},"webhookLogId":{"format":"uuid"},"fechaAprobacion":{"format":"date-time"}}}}
+]]></schema>
+<consumidores>ia_loop_worker (Integrator) · notification_worker</consumidores>
+</topic>
+<topic canon="whatsapp.inbound.received" fase="P1">
+<schema><![CDATA[
+{"$id":"https://schema.papelmind.com/events/whatsapp.inbound.received.json",
+"type":"object","required":["eventId","tenantId","eventType","timestamp","payload"],
+"properties":{
+"eventId":{"format":"uuid"},"tenantId":{"format":"uuid"},
+"eventType":{"const":"whatsapp.message.received"},
+"timestamp":{"format":"date-time"},"version":{"const":"1.0"},"traceId":{},
+"payload":{"required":["waId","mensajeExternoId","tipoContenido","clienteRelId"],
+"properties":{
+"waId":{"pattern":"^\\+[1-9]\\d{1,14}$"},
+"mensajeExternoId":{"description":"wamid idempotencia Meta"},
+"clienteRelId":{"format":"uuid"},
+"tipoContenido":{"enum":["texto","imagen","documento","audio","ubicacion","interactivo","contacto"]},
+"contenido":{"maxLength":4096},"mediaUrl":{},
+"timestampMeta":{"format":"date-time"},"mensajeId":{"format":"uuid","description":"id tmensajes"}}}}
+]]></schema>
+<consumidores>ia_loop_worker (Concierge)</consumidores>
+</topic>
+<topic canon="layaway.payment.recorded" fase="P1">
+<schema><![CDATA[
+{"$id":"https://schema.papelmind.com/events/layaway.payment.recorded.json",
+"type":"object","required":["eventId","tenantId","eventType","timestamp","payload"],
+"properties":{
+"eventId":{"format":"uuid"},"tenantId":{"format":"uuid"},
+"eventType":{"enum":["layaway.payment.recorded","layaway.liquidated","layaway.expired"]},
+"timestamp":{"format":"date-time"},"version":{"const":"1.0"},"traceId":{},
+"payload":{"required":["aparadoId","ventaId","clienteId","saldoPendiente","estado"],
+"properties":{
+"aparadoId":{"format":"uuid"},"ventaId":{"format":"uuid"},"clienteId":{"format":"uuid"},
+"abonoId":{"format":"uuid"},"monto":{"minimum":0},"saldoPendiente":{"minimum":0},
+"montoTotal":{"minimum":0},"porcentajePagado":{"minimum":0,"maximum":100},
+"metodoPago":{"enum":["efectivo","tarjeta","transferencia","puntos"]},
+"estado":{"enum":["vigente","liquidado","vencido"]},
+"fechaVencimiento":{"format":"date"},"diasParaVencer":{"type":"integer"},
+"penalizacion":{"minimum":0,"description":"solo layaway.expired"}}}}
+]]></schema>
+<consumidores>notification_worker · ia_loop_worker (Agente Ventas recordatorio T-3d)</consumidores>
+</topic>
+<topic canon="appointments.confirmed" fase="P1">
+<schema><![CDATA[
+{"$id":"https://schema.papelmind.com/events/appointments.confirmed.json",
+"type":"object","required":["eventId","tenantId","eventType","timestamp","payload"],
+"properties":{
+"eventId":{"format":"uuid"},"tenantId":{"format":"uuid"},
+"eventType":{"enum":["appointment.booked","appointment.rescheduled","appointment.cancelled","appointment.completed","appointment.no_show"]},
+"timestamp":{"format":"date-time"},"version":{"const":"1.0"},"traceId":{},
+"payload":{"required":["citaId","clienteId","fecha","horaInicio","estado"],
+"properties":{
+"citaId":{"format":"uuid"},"clienteId":{"format":"uuid"},"slotTemplateId":{"format":"uuid"},
+"sucursalId":{"format":"uuid"},"fecha":{"format":"date"},
+"horaInicio":{"pattern":"^\\d{2}:\\d{2}$"},"horaFin":{"pattern":"^\\d{2}:\\d{2}$"},
+"motivo":{},"googleEventId":{"description":"sync bidireccional"},
+"estado":{"enum":["solicitada","confirmada","agendada","cancelada","completada","no_asistio"]},
+"recordatorios":{"type":"array"},"origen":{"enum":["whatsapp","web","pos","google_sync"]}}}}
+]]></schema>
+<consumidores>ia_loop_worker (Agente Ventas: Google sync + T-24h/T-2h)</consumidores>
+</topic>
+<topic canon="tenant.created" fase="P0" schema_campos="papeleriaId, nombre, slug, plan(free|basico|profesional|enterprise), trialDias 14, origen(registro_web|admin_plataforma|migracion)" consumidores="provisioning(P2: sucursal+caja default+estaciones+seed impuestos) · notification_worker(email bienvenida)"/>
+<topic canon="notifications.email.send" fase="P1" schema_campos="destinatario(email), plantillaClave, variables{{}}, asunto, cuerpoHtml, adjuntos[], prioridad 0-3" consumidores="notification_worker(SMTP/SendGrid 1s/5s/15s)"/>
+<topic canon="inventory.transfer.completed" fase="P1" schema_campos="movimientoOrigenId/DestinoId, articuloId, sku, loteOrigen/DestinoId(mismo numero+vencimiento), sucursalOrigen/DestinoId, cantidad>0, operarioId, motivo" consumidores="notification_worker(alerta interna si cruza mínimo en origen)"/>
+<topic canon="kiosk.session.completed" fase="P2" schema_campos="sesionId, estacionId, ventaId, clienteId nullable, items[], total, metodoPago(efectivo|tarjeta|puntos), duracionSegundos KPI, verificacionPeso{teorico,registrado,dentroTolerancia}" consumidores="analytics(KPI autocheckout vs mostrador)"/>
+<topic canon="tae.transaction.completed" fase="P0" schema_campos="recargaId, ventaId, compania(TELCEL|MOVISTAR|AT&amp;T|CFE|SKY|OTRO), numeroDestino(10-15d), monto, folioAutorizacion nullable, estado(exitosa|rechazada|reversada|pendiente), intentos, tiempoRespuestaMs, motivoFalla" consumidores="notification_worker(folio WA) · ia_loop_worker(Integrator circuit breaker proveedor)"/>
+<topic canon="printing.order.completed" fase="P1" schema_campos="ordenId, ventaId, clienteId, tipo(copias_bn|copias_color|foto|escaneo|engargolado|enmicado|empastado|corte|monografia|internet), maquina, cantidadHojas/Copias, precioTotal, articuloInsumoId, fechaEntregaPrometida, estado" consumidores="notification_worker('trabajo listo') · ia_loop(Agenda entrega)"/>
+<topic canon="geo.guide.viewed" fase="P2" schema_campos="guiaId, tema(silo), visitorHash(SHA-256 IP+UA+salt diaria — LFPDPPP sin IP cruda), referrer, utm{}, duracionSegundos, articulosVistos, clickWhatsApp(conversión triángulo)" consumidores="analytics(embudo GEO: vista→click WA→venta por trace)"/>
+<topic canon="analytics.ui.correlated" fase="P2" schema_campos="traceId(EL MISMO UI→venta→predicción), uiEvents[{accion(product_view|add_to_cart|checkout_start|payment_selected|search), timestamp, articuloId}], ventaId nullable, tiempoConversionSegundos, prediccionesRelacionadas[], insights[]" consumidores="dashboard correlaciones"/>
+</contratos_eventos>
+
+<event_topic_map>
+<codigo><![CDATA[
+EVENT_TOPIC_MAP = {
+    # Ventas
+    "sale.completed": "sales.order.completed", "layaway.created": "sales.order.completed",
+    # Inventario
+    "stock.reserved": "inventory.stock.changed", "stock.deducted": "inventory.stock.changed",
+    "stock.released": "inventory.stock.changed", "stock.adjusted": "inventory.stock.changed",
+    "inventory.stock.low.detected": "inventory.stock.changed",
+    # Fiscal
+    "cfdi.requested": "fiscal.cfdi.requested",
+    # Fidelización
+    "crm.loyalty.points.accumulated": "crm.loyalty.points.moved",
+    "crm.loyalty.points.redeemed": "crm.loyalty.points.moved",
+    "crm.loyalty.level.changed": "crm.loyalty.points.moved",
+    # WhatsApp
+    "notifications.whatsapp.template": "notifications.whatsapp.send",
+    "notifications.whatsapp.text": "notifications.whatsapp.send",
+    "notifications.whatsapp.interactive": "notifications.whatsapp.send",
+    # Logística
+    "logistics.shipment.created": "logistics.shipment.updated",
+    "logistics.shipment.assigned": "logistics.shipment.updated",
+    "logistics.shipment.in_transit": "logistics.shipment.updated",
+    "logistics.shipment.delivered": "logistics.shipment.updated",
+    "logistics.shipment.failed": "logistics.shipment.updated",
+    # Pagos
+    "payments.webhook.approved": "payments.webhook.processed",
+    "payments.webhook.rejected": "payments.webhook.processed",
+    "payment.approved": "payments.webhook.processed",
+    "payment.rejected": "payments.webhook.processed",
+    "payment.refunded": "payments.webhook.processed",
+    "checkout.started": "payments.webhook.processed",
+    # WhatsApp inbound
+    "whatsapp.inbound": "whatsapp.inbound.received",
+    # Aparados
+    "layaway.payment.recorded": "layaway.payment.recorded",
+    "layaway.liquidated": "layaway.payment.recorded", "layaway.expired": "layaway.payment.recorded",
+    # Citas
+    "appointments.booked": "appointments.confirmed",
+    "appointments.rescheduled": "appointments.confirmed", "appointments.cancelled": "appointments.confirmed",
+    # Tenant
+    "tenant.created": "tenant.created",
+    # Email
+    "notifications.email.send": "notifications.email.send",
+    # Transferencias
+    "inventory.transfer.completed": "inventory.transfer.completed",
+    # Kiosco / TAE / Impresión / GEO / Analytics
+    "kiosk.session.completed": "kiosk.session.completed",
+    "tae.succeeded": "tae.transaction.completed", "tae.reversed": "tae.transaction.completed",
+    "tae.failed": "tae.transaction.completed",
+    "printing.order.completed": "printing.order.completed",
+    "geo.guide.viewed": "geo.guide.viewed",
+    "analytics.ui.correlated": "analytics.ui.correlated",
+}
+def map_event_type_to_topic(event_type: str) -> str:
+    topic = EVENT_TOPIC_MAP.get(event_type)
+    if not topic: raise ValueError(f"No existe topic para: {event_type}")
+    return topic
+]]></codigo>
+</event_topic_map>
+
+<kafka_producer><codigo><![CDATA[
+# src/infrastructure/kafka/producer.py
+import json, os
+from datetime import datetime, timezone
+from typing import Optional
+from uuid import UUID
+import structlog
+from aiokafka import AIOKafkaProducer
+from src.infrastructure.kafka.schema_validator import validate_event
+
+logger = structlog.get_logger(__name__)
+_producer: Optional[AIOKafkaProducer] = None
+
+async def get_producer() -> Optional[AIOKafkaProducer]:
+    global _producer
+    if _producer is not None: return _producer
+    bootstrap = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "")
+    if not bootstrap:
+        logger.warning("kafka.sin_bootstrap_servers_modo_dev")
+        return None
+    try:
+        _producer = AIOKafkaProducer(
+            bootstrap_servers=bootstrap,
+            value_serializer=lambda v: json.dumps(v, default=str).encode(),
+            key_serializer=lambda k: k.encode() if k else None,
+            enable_idempotence=True, acks="all",
+            retry_backoff_ms=500, request_timeout_ms=30000,
+        )
+        await _producer.start()
+        logger.info("kafka.producer_iniciado", bootstrap=bootstrap)
+        return _producer
+    except Exception as e:
+        logger.error("kafka.producer_error", error=str(e)[:200])
+        _producer = None
+        return None
+
+async def close_producer() -> None:
+    global _producer
+    if _producer:
+        try: await _producer.stop()
+        except Exception: pass
+        _producer = None
+
+async def publish_event(topic: str, key: str, value: dict, *, validate: bool = True) -> bool:
+    if validate:
+        validate_event(topic, value)
+    producer = await get_producer()
+    if producer is None:
+        logger.warning("kafka.publish_modo_simulado", topic=topic, event_type=value.get("eventType"))
+        return False
+    try:
+        await producer.send_and_wait(topic=topic, key=key, value=value)
+        logger.debug("kafka.published", topic=topic, key=key)
+        return True
+    except Exception as e:
+        logger.error("kafka.publish_error", topic=topic, key=key, error=str(e)[:200])
+        raise
+
+def build_envelope(event_id: UUID, tenant_id: UUID, event_type: str,
+                   payload: dict, trace_id: Optional[str] = None, version: str = "1.0") -> dict:
+    return {
+        "eventId": str(event_id), "tenantId": str(tenant_id),
+        "eventType": event_type,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": version,
+        "traceId": trace_id or str(event_id),
+        "payload": payload,
+    }
+]]></codigo>
+</kafka_producer>
+
+<!-- ============ 9 WORKERS (F17 aplicado + F1-F7 previos) ============ -->
+<workers>
+<worker nombre="outbox_worker" fase="P0-P1" trigger="polling 1s" fixes="F1 WorkerSessionLocal · F3 DLQ terminal · F7 traceId · F17 P0-aware">
+<codigo><![CDATA[
+# src/infrastructure/workers/outbox_worker.py
+import asyncio, json
+from datetime import datetime, timezone
+from sqlalchemy import text
+from src.infrastructure.db.session import WorkerSessionLocal   # FIX F1: erp_worker BYPASSRLS
+from src.infrastructure.kafka.producer import publish_event
+from src.infrastructure.kafka.topics import map_event_type_to_topic
+from src.core.config import settings
+from src.core.metrics import OUTBOX_PENDING_EVENTS, OUTBOX_DLQ_TOTAL
+import structlog
+
+logger = structlog.get_logger(__name__)
+DLQ_MAX_INTENTOS = 3
+POLL_INTERVAL = 2
+BATCH_SIZE = 100
+
+async def process_outbox_events():
+    while True:
+        try:
+            # F17: P0 = MODO COLA DE TRABAJO. Sin Kafka no hay nada que publicar
+            # ni marcar. Los consumers (loyalty_worker) polllean con SUS flags
+            # (procesado_loyalty). Este worker es irrelevante en P0.
+            if not settings.KAFKA_BOOTSTRAP_SERVERS:
+                await asyncio.sleep(5)
+                continue
+            async with WorkerSessionLocal() as session:
+                result = await session.execute(text("""
+                    SELECT id, papeleria_id, tipo, aggregate_type, aggregate_id,
+                           payload, client_uuid, intentos, trace_id
+                    FROM outbox_eventos
+                    WHERE publicado_kafka = false
+                      AND intentos < :max_i
+                    ORDER BY created_at ASC
+                    LIMIT :lim
+                    FOR UPDATE SKIP LOCKED
+                """), {"max_i": DLQ_MAX_INTENTOS, "lim": BATCH_SIZE})
+                events = result.fetchall()
+                publicados = fallidos = 0
+                for event in events:
+                    try:
+                        topic = map_event_type_to_topic(event.tipo)
+                        payload = event.payload if isinstance(event.payload, dict) else json.loads(event.payload)
+                        envelope = {
+                            "eventId": str(event.id), "tenantId": str(event.papeleria_id),
+                            "eventType": event.tipo,
+                            "timestamp": datetime.now(timezone.utc).isoformat(),
+                            "version": "1.0",
+                            "traceId": payload.get("traceId") or event.trace_id or str(event.id),
+                            "payload": payload,
+                        }
+                        published = await publish_event(topic=topic, key=str(event.papeleria_id),
+                                                        value=envelope, validate=False)
+                        if published:
+                            await session.execute(text("""
+                                UPDATE outbox_eventos
+                                SET publicado_kafka = true, procesado_en = NOW()
+                                WHERE id = :id
+                            """), {"id": str(event.id)})
+                            publicados += 1
+                        else:
+                            logger.warning("outbox.kafka_no_disponible", event_id=str(event.id))
+                            break
+                    except Exception as e:
+                        nuevos = event.intentos + 1
+                        if nuevos >= DLQ_MAX_INTENTOS:
+                            await publish_event(topic="dlq.events", key=str(event.papeleria_id),
+                                value={"eventId": str(event.id), "eventType": event.tipo,
+                                       "tenantId": str(event.papeleria_id), "error": str(e)[:500],
+                                       "intentos": nuevos,
+                                       "firstFailedAt": datetime.now(timezone.utc).isoformat()})
+                            OUTBOX_DLQ_TOTAL.inc()
+                        await session.execute(text("""
+                            UPDATE outbox_eventos SET intentos = :i, error_ultimo = :err
+                            WHERE id = :id
+                        """), {"i": nuevos, "err": str(e)[:500], "id": str(event.id)})
+                        fallidos += 1
+                await session.commit()
+                if publicados > 0 or fallidos > 0:
+                    logger.info("outbox.ciclo", publicados=publicados, fallidos=fallidos, total=len(events))
+        except Exception:
+            logger.exception("outbox_worker.error_loop")
+        await asyncio.sleep(POLL_INTERVAL)
+
+if __name__ == "__main__":
+    asyncio.run(process_outbox_events())
+]]></codigo>
+</worker>
+
+<worker nombre="loyalty_worker" fase="P0" trigger="polling 5s" fixes="F1 · F4 EMITE evento · F17 procesado_loyalty">
+<codigo><![CDATA[
+# src/infrastructure/workers/loyalty_worker.py
+import asyncio, json
+from decimal import Decimal
+from sqlalchemy import select, text
+from src.infrastructure.db.session import WorkerSessionLocal
+from src.infrastructure.db.models import TTarjetaConsentido, TMovimientoPuntos, TVenta
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+async def enqueue_event(session, tenant_id, event_type, aggregate, agg_id, payload):
+    """F17: escribe en outbox con flags separados. En P0 sin Kafka, el loyalty_worker
+    sigue funcionando porque polllea por procesado_loyalty (no por procesado)."""
+    await session.execute(text("""
+        INSERT INTO outbox_eventos (id, papeleria_id, tipo, aggregate_type, aggregate_id,
+            payload, procesado_loyalty, publicado_kafka, intentos)
+        VALUES (generate_uuid_v7(), :tid, :tipo, :agg, :aggid, CAST(:payload AS jsonb), false, false, 0)
+    """), {"tid": str(tenant_id), "tipo": event_type, "agg": aggregate,
+           "aggid": str(agg_id), "payload": json.dumps(payload, default=str)})
+
+async def process_loyalty_events():
+    while True:
+        try:
+            async with WorkerSessionLocal() as session:
+                # F17: checkpoint PROPIO, independiente de Kafka
+                result = await session.execute(text("""
+                    SELECT e.id, e.papeleria_id, e.payload, e.client_uuid
+                    FROM outbox_eventos e
+                    JOIN tventas v ON v.client_uuid = e.client_uuid
+                    WHERE e.tipo = 'sale.completed'
+                      AND e.procesado_loyalty = false          -- ANTES: e.procesado = true (nunca ocurría en P0)
+                      AND v.cliente_rel_id IS NOT NULL
+                      AND NOT EXISTS (SELECT 1 FROM tmovimientospuntos mp
+                                      WHERE mp.venta_id = v.id AND mp.tipo = 'acumulacion')
+                    LIMIT 50
+                """))
+                events = result.fetchall()
+                ids_procesados = []
+                for event in events:
+                    payload = event.payload if isinstance(event.payload, dict) else json.loads(event.payload)
+                    total = Decimal(str(payload.get("total", 0)))
+                    venta = (await session.execute(select(TVenta)
+                        .where(TVenta.client_uuid == event.client_uuid))).scalar_one_or_none()
+                    if not venta: continue
+                    tarjeta = (await session.execute(select(TTarjetaConsentido)
+                        .where(TTarjetaConsentido.cliente_rel_id == venta.cliente_rel_id))).scalar_one_or_none()
+                    if not tarjeta:
+                        tarjeta = TTarjetaConsentido(papeleria_id=event.papeleria_id,
+                            cliente_rel_id=venta.cliente_rel_id,
+                            saldo_puntos=Decimal("0.00"), nivel="bronce")
+                        session.add(tarjeta); await session.flush()
+                    saldo_ant, nivel_ant = tarjeta.saldo_puntos, tarjeta.nivel
+                    nuevo = saldo_ant + total
+                    if   nuevo >= 10000: tarjeta.nivel = "platino"
+                    elif nuevo >= 5000:  tarjeta.nivel = "oro"
+                    elif nuevo >= 1000:  tarjeta.nivel = "plata"
+                    tarjeta.saldo_puntos = nuevo
+                    session.add(TMovimientoPuntos(papeleria_id=event.papeleria_id,
+                        tarjeta_id=tarjeta.id, venta_id=venta.id, tipo="acumulacion",
+                        puntos=total, saldo_anterior=saldo_ant, saldo_nuevo=nuevo))
+                    # FIX F4: EMITIR (cadena notification_worker)
+                    await enqueue_event(session, event.papeleria_id,
+                        "crm.loyalty.points.accumulated", "tarjeta", tarjeta.id,
+                        {"tarjetaId": str(tarjeta.id), "clienteId": str(venta.cliente_rel_id),
+                         "ventaId": str(venta.id), "tipoMovimiento": "acumulacion",
+                         "puntosMovimiento": float(total),
+                         "saldoPuntosAnterior": float(saldo_ant),
+                         "saldoPuntosResultante": float(nuevo),
+                         "nivelAnterior": nivel_ant, "nivelResultante": tarjeta.nivel,
+                         "montoCompra": float(total)})
+                    if tarjeta.nivel != nivel_ant:
+                        await enqueue_event(session, event.papeleria_id,
+                            "crm.loyalty.level.changed", "tarjeta", tarjeta.id,
+                            {"tarjetaId": str(tarjeta.id), "clienteId": str(venta.cliente_rel_id),
+                             "nivelAnterior": nivel_ant, "nivelResultante": tarjeta.nivel})
+                    ids_procesados.append(str(event.id))
+                # F17: marcar procesados en la MISMA transacción del lote
+                if ids_procesados:
+                    await session.execute(text("""
+                        UPDATE outbox_eventos SET procesado_loyalty = true
+                        WHERE id = ANY(:ids)
+                    """), {"ids": ids_procesados})
+                await session.commit()
+        except Exception:
+            logger.exception("loyalty_worker.error_loop")
+        await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    asyncio.run(process_loyalty_events())
+]]></codigo>
+</worker>
+
+<worker nombre="cfdi_worker" fase="P0" trigger="polling 10s" fixes="F1 WorkerSessionLocal">
+<codigo><![CDATA[
+# src/infrastructure/workers/cfdi_worker.py
+import asyncio
+from datetime import datetime, timezone
+from sqlalchemy import select
+from src.infrastructure.db.session import WorkerSessionLocal
+from src.infrastructure.db.models import TFacturaCFDI
+from src.infrastructure.external.pac_primary import pac_primary
+from src.infrastructure.external.pac_fallback import pac_fallback
+from src.domain.exceptions import PACException
+from src.core.metrics import CFDI_TIMBRADO_RETRY_COUNT
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+async def process_cfdi_queue():
+    while True:
+        try:
+            async with WorkerSessionLocal() as session:
+                facturas = (await session.execute(select(TFacturaCFDI)
+                    .where(TFacturaCFDI.estado_cfdi == "solicitado").limit(10))).scalars().all()
+                for f in facturas:
+                    try:
+                        uuid_sat = await pac_primary.timbrar(f)
+                        f.proveedor_timbrado, f.estado_cfdi = "PAC_PRIMARY", "timbrado"
+                    except PACException:
+                        CFDI_TIMBRADO_RETRY_COUNT.labels(proveedor="PAC_PRIMARY", status="error").inc()
+                        try:
+                            uuid_sat = await pac_fallback.timbrar(f)
+                            f.proveedor_timbrado, f.estado_cfdi = "PAC_FALLBACK", "timbrado"
+                        except PACException:
+                            f.estado_cfdi = "error_dlq"
+                            CFDI_TIMBRADO_RETRY_COUNT.labels(proveedor="PAC_FALLBACK", status="error").inc()
+                            continue
+                    f.uuid_sat = uuid_sat
+                    f.fecha_timbrado = datetime.now(timezone.utc)
+                    await session.commit()
+        except Exception:
+            logger.exception("cfdi_worker.error_loop")
+        await asyncio.sleep(10)
+
+if __name__ == "__main__":
+    asyncio.run(process_cfdi_queue())
+]]></codigo>
+</worker>
+
+<worker nombre="inventory_alert_worker" fase="P0" trigger="polling 30s" fixes="F1 · F6 evento+alerta+anti-dup · F18 usa talertasreposicion">
+<codigo><![CDATA[
+# src/infrastructure/workers/inventory_alert_worker.py
+import asyncio, json
+from sqlalchemy import text
+from src.infrastructure.db.session import WorkerSessionLocal
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+async def process_inventory_alerts():
+    while True:
+        try:
+            async with WorkerSessionLocal() as session:
+                # F18: usa talertasreposicion (restaurada) — NO talertasrestock
+                result = await session.execute(text("""
+                    SELECT a.id, a.sku, a.descripcion, a.stock_minimo, a.papeleria_id,
+                           COALESCE(SUM(v.stock_sucursal), 0) AS stock_total
+                    FROM tarticulos a
+                    LEFT JOIN vw_stock_sucursal v ON v.articulo_id = a.id
+                    WHERE a.activo = true
+                      AND NOT EXISTS (SELECT 1 FROM talertasreposicion ar
+                                      WHERE ar.articulo_id = a.id
+                                        AND ar.estado IN ('pendiente','en_compra'))
+                    GROUP BY a.id, a.sku, a.descripcion, a.stock_minimo, a.papeleria_id
+                    HAVING COALESCE(SUM(v.stock_sucursal), 0) <= a.stock_minimo
+                """))
+                for art in result.fetchall():
+                    faltante = art.stock_minimo - art.stock_total
+                    prioridad = "critico" if faltante > art.stock_minimo else "urgente"
+                    await session.execute(text("""
+                        INSERT INTO talertasreposicion (id, papeleria_id, articulo_id,
+                            stock_actual, stock_minimo, faltante, prioridad, estado)
+                        VALUES (generate_uuid_v7(), :tid, :aid, :st, :mn, :f, :pr, 'pendiente')
+                    """), {"tid": str(art.papeleria_id), "aid": str(art.id), "st": art.stock_total,
+                           "mn": art.stock_minimo, "f": faltante, "pr": prioridad})
+                    await session.execute(text("""
+                        INSERT INTO outbox_eventos (id, papeleria_id, tipo, aggregate_type,
+                            aggregate_id, payload, procesado_loyalty, publicado_kafka, intentos)
+                        VALUES (generate_uuid_v7(), :tid, 'inventory.stock.low.detected',
+                            'articulo', :aid, CAST(:p AS jsonb), false, false, 0)
+                    """), {"tid": str(art.papeleria_id), "aid": str(art.id),
+                           "p": json.dumps({"articuloId": str(art.id), "sku": art.sku,
+                               "stockDisponibleResultante": art.stock_total,
+                               "stockMinimo": art.stock_minimo, "faltante": faltante,
+                               "prioridad": prioridad})})
+                    await session.commit()
+        except Exception:
+            logger.exception("inventory_alert_worker.error_loop")
+        await asyncio.sleep(30)
+
+if __name__ == "__main__":
+    asyncio.run(process_inventory_alerts())
+]]></codigo>
+</worker>
+
+<worker nombre="notification_worker" fase="P0" trigger="Kafka consumer notifications.*" fixes="F5 stub→implementación completa">
+<codigo><![CDATA[
+# src/infrastructure/workers/notification_worker.py
+import asyncio, json, httpx
+from aiokafka import AIOKafkaConsumer
+from src.core.config import settings
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+class NotificationWorker:
+    def __init__(self):
+        self.wa_endpoint = f"https://graph.facebook.com/v18.0/{settings.WHATSAPP_PHONE_NUMBER_ID}/messages"
+
+    async def _enviar_whatsapp(self, numero: str, payload: dict) -> dict:
+        headers = {"Authorization": f"Bearer {settings.WHATSAPP_ACCESS_TOKEN}"}
+        body = {"messaging_product": "whatsapp",
+                "to": numero.replace("+","").replace(" ","").replace("-","")}
+        if payload.get("tipoContenido") == "template":
+            body["type"] = "template"
+            body["template"] = {"name": payload["plantilla"]["nombre"],
+                                "language": {"code": payload["plantilla"].get("idioma","es_MX")}}
+        elif payload.get("tipoContenido") == "interactive":
+            body["type"] = "interactive"; body["interactive"] = payload["interactivo"]
+        else:
+            body["type"] = "text"; body["text"] = {"body": payload.get("texto","")[:4096]}
+        delays = [1, 5, 15]
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            for i in range(3):
+                try:
+                    r = await client.post(self.wa_endpoint, json=body, headers=headers)
+                    if r.status_code == 200:
+                        return {"ok": True, "mensajeExternoId": r.json().get("messages",[{}])[0].get("id")}
+                except Exception as e:
+                    logger.warning(f"notification_worker.intento_{i+1}_fallo", error=str(e)[:200])
+                if i < 2: await asyncio.sleep(delays[i])
+        return {"ok": False}
+
+    async def run(self):
+        consumer = AIOKafkaConsumer("notifications.whatsapp.send", "notifications.email.send",
+            bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS, group_id="notification_group")
+        await consumer.start()
+        try:
+            async for msg in consumer:
+                event = json.loads(msg.value.decode())
+                payload = event["payload"]
+                if msg.topic == "notifications.whatsapp.send":
+                    res = await self._enviar_whatsapp(payload["numeroDestino"], payload)
+                    logger.info(f"[WA] {event['eventType']} → {payload['numeroDestino']}: {res}")
+        finally:
+            await consumer.stop()
+
+if __name__ == "__main__":
+    asyncio.run(NotificationWorker().run())
+]]></codigo>
+</worker>
+
+<worker nombre="ia_loop_worker" fase="P1" trigger="5 topics" orquestador="LangGraph">
+<descripcion>Consume sales.order.completed, whatsapp.inbound.received, appointments.confirmed,
+inventory.stock.changed, payments.webhook.processed. Orquesta 5 agentes (Concierge, Ventas/Citas,
+Supply Chain, Marketing, Integrator) con presupuesto LLM por tenant + PII masking. Anti-dup por
+agente: Supply = NOT EXISTS orden_compra del mismo evento.</descripcion>
+</worker>
+
+<worker nombre="reservation_sweeper" fase="P1" trigger="cron 1min" fixes="F1 · F20 libera a nivel ARTÍCULO">
+<codigo><![CDATA[
+# src/infrastructure/workers/reservation_sweeper.py
+import asyncio
+from sqlalchemy import text
+from src.infrastructure.db.session import WorkerSessionLocal
+import structlog
+
+logger = structlog.get_logger(__name__)
+
+async def sweep_reservations():
+    while True:
+        try:
+            async with WorkerSessionLocal() as session:
+                # F20: libera a nivel ARTÍCULO (tarticulos.stock_reservado) — consistente
+                # con reservar_stock del cart_service. NO toca tlotes.cantidad_reservada
+                # (esa es exclusiva de APARADOS).
+                await session.execute(text("""
+                    WITH items_expirados AS (
+                        UPDATE tcarritoitems SET reserva_activa = false
+                        WHERE reserva_activa AND fecha_expiracion_reserva < NOW()
+                        RETURNING carrito_id, articulo_id, cantidad
+                    ), liberacion AS (
+                        UPDATE tarticulos a SET stock_reservado =
+                            GREATEST(0, a.stock_reservado - sub.total_cantidad)
+                        FROM (SELECT articulo_id, SUM(cantidad) total_cantidad
+                              FROM items_expirados GROUP BY articulo_id) sub
+                        WHERE a.id = sub.articulo_id RETURNING a.id
+                    )
+                    UPDATE tcarritos c SET estado = 'expirado'
+                    WHERE c.estado = 'activo'
+                      AND NOT EXISTS (SELECT 1 FROM tcarritoitems i
+                                      WHERE i.carrito_id = c.id AND i.reserva_activa);
+                """))
+                await session.commit()
+        except Exception as e:
+            logger.debug("reservation_sweeper.skip", error=str(e)[:100])
+        await asyncio.sleep(60)
+
+if __name__ == "__main__":
+    asyncio.run(sweep_reservations())
+]]></codigo>
+</worker>
+
+<worker nombre="ai_campaign_worker" fase="P2" trigger="cron nocturno 03:00">
+<descripcion>Batch nocturno (WorkerSessionLocal): 1) recalcular segmentos RFM
+2) regenerar embeddings catálogo → tiainteraccionesvector 3) ofertas baja rotación (sin venta 60d)
+4) programar campañas aprobadas con capping 5) expirar puntos por inactividad → tipo 'expiracion'</descripcion>
+</worker>
+
+<worker nombre="dlq_consumer" fase="P2" estado="NUEVO v2.1.2" trigger="Kafka consumer dlq.events" fixes="F26 usa settings.KAFKA_BOOTSTRAP_SERVERS">
+<codigo><![CDATA[
+# src/infrastructure/workers/dlq_consumer.py
+import asyncio, json
+from datetime import datetime, timezone
+from aiokafka import AIOKafkaConsumer
+from sqlalchemy import text
+from src.infrastructure.db.session import WorkerSessionLocal
+from src.core.config import settings
+
+async def consume_dlq():
+    """Persiste eventos DLQ en tdlq_eventos (retención 90d vs 30d del topic crudo).
+    FIX F9: historial_intentos JSONB con trazabilidad por intento.
+    FIX F26: usa settings.KAFKA_BOOTSTRAP_SERVERS (no hardcodea kafka:9092)."""
+    consumer = AIOKafkaConsumer("dlq.events",
+                                bootstrap_servers=settings.KAFKA_BOOTSTRAP_SERVERS,
+                                group_id="dlq_group")
+    await consumer.start()
+    try:
+        async for msg in consumer:
+            ev = json.loads(msg.value.decode())
+            async with WorkerSessionLocal() as session:
+                await session.execute(text("""
+                    INSERT INTO tdlq_eventos (id, outbox_evento_id, papeleria_id, event_type,
+                        aggregate_type, aggregate_id, payload, error_ultimo,
+                        historial_intentos, trace_id, estado, first_failed_at)
+                    VALUES (generate_uuid_v7(), :oeid, :tid, :etipo, :agg, :aggid,
+                        CAST(:payload AS jsonb), :err,
+                        CAST(:hist AS jsonb), :trace, 'pendiente', NOW())
+                    ON CONFLICT (outbox_evento_id) DO UPDATE
+                    SET error_ultimo = EXCLUDED.error_ultimo,
+                        historial_intentos = tdlq_eventos.historial_intentos ||
+                            CAST(:nuevo_intento AS jsonb)
+                """), {
+                    "oeid": ev.get("eventId"), "tid": ev.get("tenantId"),
+                    "etipo": ev.get("eventType"), "agg": ev.get("aggregate_type"),
+                    "aggid": ev.get("aggregate_id"),
+                    "payload": json.dumps(ev.get("payload", {})),
+                    "err": ev.get("error"), "trace": ev.get("traceId"),
+                    "hist": json.dumps([{"intento": ev.get("intentos"),
+                                         "error": ev.get("error"),
+                                         "timestamp": datetime.now(timezone.utc).isoformat()}]),
+                    "nuevo_intento": json.dumps({"intento": ev.get("intentos"),
+                                                 "error": ev.get("error"),
+                                                 "timestamp": datetime.now(timezone.utc).isoformat()})})
+                await session.commit()
+    finally:
+        await consumer.stop()
+
+if __name__ == "__main__":
+    asyncio.run(consume_dlq())
+]]></codigo>
+</worker>
+
+<!-- Workers auxiliares de notification_worker (F26: renombrados, NO cuentan como worker independiente) -->
+<worker nombre="notification_worker/email_queue" fase="P0" tipo="cola_interna_de_notification_worker">
+<descripcion>F26: archivo `backend/src/infrastructure/workers/notification_worker/email_queue.py`.
+NO es un worker independiente — es una cola interna que notification_worker consume del topic
+notifications.email.send. Antes se listaba erróneamente como worker separado (email_queue_worker),
+inflando el conteo a 11-12. Canon: 9 workers.</descripcion>
+</worker>
+<worker nombre="notification_worker/push_queue" fase="P0" tipo="cola_interna_de_notification_worker">
+<descripcion>F26: archivo `backend/src/infrastructure/workers/notification_worker/push_queue.py`.
+NO es un worker independiente — es la cola de push notifications que notification_worker consume
+junto con la de WhatsApp y email. Canon: 9 workers (outbox, loyalty, cfdi, inventory_alert,
+notification, ia_loop, reservation_sweeper, ai_campaign, dlq_consumer).</descripcion>
+</worker>
+</workers>
+</seccion_7_contratos_workers>
+
+<!-- ============================================================================ -->
+<!-- SECCIÓN 8: SEGURIDAD + OBSERVABILIDAD + DLQ OPERATIONS — F26 APLICADO       -->
+<!-- ============================================================================ -->
+<seccion_8_seguridad_observabilidad fase="P0-P2">
+<seguridad>
+<roles_canon>
+<rol nombre="superadmin" alcance="Plataforma, cruza tenants; TODO acceso → tauditlogs(motivo OBLIGATORIO)"/>
+<rol nombre="admin" alcance="Tenant completo"/>
+<rol nombre="cajero" alcance="Caja + rompefila + almacén"/>
+<rol nombre="contador" alcance="Fiscal/reportes, sin operaciones de venta"/>
+<rol nombre="cliente" alcance="E-commerce/WhatsApp"/>
+<rol nombre="system" alcance="Service accounts workers/BOT_IA (es_bot)"/>
+<rol nombre="repartidor" fase="P2"/><rol nombre="proveedor" fase="P2"/>
+</roles_canon>
+<auth>
+<jwt>access 15min · refresh ROTACIÓN · web httpOnly cookie 8h · POS 30d device-binding</jwt>
+<factor2>TOTP PyOTP admin/contador · OTP WhatsApp cliente (6d, TTL 5min, 3 intentos, 60s reenvío)</factor2>
+<login_multi_tenant>POST /auth/login → lista tenants → selección EXPLÍCITA (UC-005) → JWT {sub, tenant_id, role, rel_id}</login_multi_tenant>
+</auth>
+<rbac_p2>Casbin namespaces: venta:crear|ver|cancelar|devolver · inventario:* · catalogo:* · config:* · reporte:*</rbac_p2>
+<endpoints_publicos rol_db="erp_worker" total="4">webhooks/payments · autofactura/solicitar · tracking/{qr_token} · whatsapp/webhook</endpoints_publicos>
+<rate_limiting>Redis token bucket: 30/min wa_id · 100/min IP pública · 10/min autofactura token</rate_limiting>
+</seguridad>
+
+<observabilidad>
+<metricas_prometheus total="24" fix="F26 — conteo corregido (declaradas 24 vs listadas 20)">
+<descripcion>F26: el canon v2.2.0 declaraba "24 métricas" pero solo listaba 20. Se añaden las
+4 faltantes (erp_http_requests_total, erp_ws_connections_active, erp_kafka_consumer_lag,
+erp_cfdi_timbrado_success_total) para cuadrar el conteo real a 24.</descripcion>
+<metrica nombre="erp_http_request_duration_seconds" tipo="Histogram" labels="method,handler,status_code"/>
+<metrica nombre="erp_http_requests_total" tipo="Counter" labels="method,handler,status_code" fix="F26 — faltante añadida"/>
+<metrica nombre="erp_pos_ventas_total" tipo="Counter" labels="tenant_id,origen,metodo_pago"/>
+<metrica nombre="erp_fefo_allocation_latency_seconds" tipo="Histogram" labels="tenant_id"/>
+<metrica nombre="erp_outbox_pending_events_count" tipo="Gauge" labels="tenant_id"/>
+<metrica nombre="erp_outbox_dlq_total" tipo="Counter"/>
+<metrica nombre="erp_cfdi_timbrado_retries_total" tipo="Counter" labels="proveedor,status"/>
+<metrica nombre="erp_cfdi_timbrado_success_total" tipo="Counter" labels="proveedor" fix="F26 — faltante añadida"/>
+<metrica nombre="erp_payments_total/amount/errors" tipo="Counter" labels="method,status"/>
+<metrica nombre="erp_whatsapp_send_total" tipo="Counter" labels="tipo,estado"/>
+<metrica nombre="erp_tae_latency_ms" tipo="Histogram" labels="compania"/>
+<metrica nombre="erp_dlq_events_total" tipo="Counter" labels="event_type"/>
+<metrica nombre="erp_dlq_pending_events" tipo="Gauge"/>
+<metrica nombre="erp_dlq_oldest_age_seconds" tipo="Gauge"/>
+<metrica nombre="erp_dlq_replay_total" tipo="Counter" labels="result(success|error)"/>
+<metrica nombre="erp_dlq_discard_total" tipo="Counter"/>
+<metrica nombre="erp_dlq_replay_batch_size" tipo="Histogram"/>
+<metrica nombre="erp_db_pool_saturation" tipo="Gauge" labels="engine"/>
+<metrica nombre="erp_db_pool_overflow_active" tipo="Gauge" labels="engine"/>
+<metrica nombre="erp_postgres_max_connections_used" tipo="Gauge"/>
+<metrica nombre="erp_api_request_queued" tipo="Histogram"/>
+<metrica nombre="erp_db_pool_connections" tipo="Gauge" labels="engine"/>
+<metrica nombre="erp_ws_connections_active" tipo="Gauge" labels="tenant_id" fix="F26 — faltante añadida"/>
+<metrica nombre="erp_kafka_consumer_lag" tipo="Gauge" labels="topic,group" fix="F26 — faltante añadida"/>
+</metricas_prometheus>
+<alertas total="15">
+<alerta id="A1" nombre="OutboxLagging" expr="sum(erp_outbox_pending_events_count)>100" for="3m" severidad="critical"/>
+<alerta id="A2" nombre="OutboxDLQ" expr="increase(erp_outbox_dlq_total[1h])>5" severidad="warning"/>
+<alerta id="A3" nombre="CFDI-PAC-Failure" expr="rate(erp_cfdi_timbrado_retries_total{status='error'}[5m])>0.1" for="2m" severidad="warning"/>
+<alerta id="A4" nombre="FEFO-Latency" expr="histogram_quantile(0.95,rate(erp_fefo_allocation_latency_seconds_bucket[5m]))>2" for="1m" severidad="critical"/>
+<alerta id="A5" nombre="API-5xx" expr="5xx rate>5%" for="2m" severidad="critical"/>
+<alerta id="A6" nombre="PG-Connections" expr="pg_stat_activity_count>80" for="5m" severidad="warning"/>
+<alerta id="A7" nombre="Disk" expr="disco&lt;10%" for="5m" severidad="critical"/>
+<alerta id="A8" nombre="LoyaltyWorker-Down" expr="up{job='loyalty-worker'}==0" for="1m" severidad="critical"/>
+<alerta id="A9" nombre="RAM" expr="process_resident_memory_bytes>1GB" for="5m" severidad="warning"/>
+<alerta id="A10" nombre="TAE-Provider" expr="latencia media TAE>8s" for="5m" severidad="warning"/>
+<alerta id="A11" nombre="DLQ-Rate" expr="increase(erp_dlq_events_total[1h])>10" severidad="warning"/>
+<alerta id="A12" nombre="DLQ-Oldest-Age" expr="erp_dlq_oldest_age_seconds>86400" for="30m" severidad="warning"/>
+<alerta id="A13" nombre="DLQ-Replay-Failures" expr="increase(erp_dlq_replay_total{result='error'}[6h])>5" severidad="critical"/>
+<alerta id="A14" nombre="DLQ-Pending-Growth" expr="increase(erp_dlq_pending_events[24h])>50" severidad="warning"/>
+<alerta id="A15" nombre="Pool-Saturation" expr="erp_db_pool_saturation>0.8" for="5m" severidad="critical"/>
+</alertas>
+</observabilidad>
+
+<dlq_operations fase="P2" prioridad="critica-operativa">
+<razon>
+El reintento automático (dlq_replayer cada 6h) NO resuelve errores semánticos
+(datos malos, contrato roto, proveedor cambió). Esos requieren intervención
+humana con contexto. Este bloque canoniza la superficie operativa mínima.
+</razon>
+<endpoints_admin auth="superadmin|admin" rol_db="erp_app con RLS (tenant-scoped)">
+<endpoint metodo="GET" path="/api/v1/admin/dlq/eventos" query="estado,event_type,desde,hasta,limit≤200,offset" desc="Lista paginada tdlq_eventos"/>
+<endpoint metodo="GET" path="/api/v1/admin/dlq/eventos/{id}" desc="Detalle con payload + historial_intentos"/>
+<endpoint metodo="POST" path="/api/v1/admin/dlq/eventos/{id}/replay" desc="Replay individual: intentos=0, procesado=false, estado='reintentado', audit DLQ_MANUAL_ACTION"/>
+<endpoint metodo="POST" path="/api/v1/admin/dlq/replay-batch" fixes="F8">
+<request><![CDATA[{"ids": ["uuid"...], "confirm": true}]]></request>
+<reglas>LÍMITE DURO 1000 (400 si excede) · confirm=true OBLIGATORIO (428 si false) · marca replayer_corrida_id común · audit DLQ_MANUAL_ACTION con batch_id</reglas>
+</endpoint>
+<endpoint metodo="POST" path="/api/v1/admin/dlq/eventos/{id}/discard" desc="Descarte con motivo OBLIGATORIO (min 10 chars): estado='descartado', audit DLQ_DISCARD"/>
+<endpoint metodo="GET" path="/api/v1/admin/dlq/stats" desc="Conteos por estado/tipo/edad; alimenta dashboard"/>
+</endpoints_admin>
+<dashboard nombre="DLQ Console" url="admin.papelmind.com/dlq" roles="admin,contador">
+<vistas total="3">
+<vista id="pendientes" default="true">tabla con badges de estado · filtros · acciones por fila</vista>
+<vista id="por_tipo">agrupado por event_type con counts</vista>
+<vista id="historico">incluye descartados + resueltos + reintentados</vista>
+</vistas>
+<filtros_preset total="4">
+<preset nombre="recientes_24h" filtro="first_failed_at > NOW() - INTERVAL '24 hours'"/>
+<preset nombre="por_tenant" filtro="papeleria_id = :selected"/>
+<preset nombre="por_tipo" filtro="event_type = :selected"/>
+<preset nombre="reintentables" filtro="estado='pendiente' AND intentos &lt; 3"/>
+</filtros_preset>
+<acciones total="5">
+<accion nombre="replay_individual" audit="DLQ_MANUAL_ACTION"/>
+<accion nombre="replay_batch" audit="DLQ_MANUAL_ACTION" limite="1000"/>
+<accion nombre="descartar" audit="DLQ_DISCARD" motivo_obligatorio="min 10 chars"/>
+<accion nombre="reintentar_todo_pendiente" limite="1000"/>
+<accion nombre="exportar_csv" audit="DLQ_MANUAL_ACTION"/>
+</acciones>
+<ui canon="paleta Azul Mind (backoffice) + alerta rojo #E53935 para críticos"/>
+</dashboard>
+<notificaciones>
+<canal tipo="whatsapp_admin" cuando="dlq_total_actual > 10 AND duracion > 15min"/>
+<canal tipo="email_admin" cuando="dlq_por_tipo.cfdi > 50 OR dlq_por_tipo.payments > 20"/>
+<canal tipo="slack_interno" cuando="dlq_replay_failed_terminal > 5 en una corrida nocturna"/>
+</notificaciones>
+</dlq_operations>
+
+<health>/health liveness · /ready (PG+Redis+Kafka si set) · /metrics Prometheus</health>
+<endpoint_metricas fixes="F10">
+<endpoint metodo="GET" path="/api/v1/metricas" auth="admin|contador|superadmin" desc="PRE-AGREGACIÓN de métricas de NEGOCIO: ventas hoy/semana/mes, top productos, ticket promedio, conversión web, KPIs DLQ, uso de pools. Caché Redis 30s. DISTINTO de /metrics (Prometheus técnico)."/>
+</endpoint_metricas>
+</seccion_8_seguridad_observabilidad>

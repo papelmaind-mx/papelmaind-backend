@@ -1,0 +1,22 @@
+[project]
+name = "papelmaind"
+version = "2.3.1"
+description = "SaaS multi-tenant omnicanal para cadenas de papelerías"
+requires-python = ">=3.12"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "C4", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/tests"]

@@ -1,20 +1,41 @@
+# Python
 __pycache__/
-*.pyc
-*.bak
-*.bak2
-*.bak_fix
-.env
-.venv/
-node_modules/
-*d3_xml.txt
-*.txt.bak
-.env
-.venv/
+*.py[cod]
+*$py.class
+*.so
+.Python
 venv/
-*.egg-info/
+.venv/
+ENV/
+env/
 .pytest_cache/
-htmlcov/
+.mypy_cache/
+.ruff_cache/
 .coverage
+htmlcov/
+
+# Node
+node_modules/
 dist/
-pgdata/
-backend/.pytest_cache/
+.next/
+out/
+*.log
+
+# Env
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Build
+build/
+*.egg-info/
