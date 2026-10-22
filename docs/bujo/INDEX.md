@@ -1,8 +1,7 @@
-<!-- AUTO-GENERATED: usa `bujo-note: reindex` para actualizar esta tabla -->
+<!-- AUTO-GENERATED: usa 'bujo-note: reindex' para actualizar -->
 # 🗂️ Índice de Notas BuJo
 
-| ID | Título | Estado | Prioridad | Última actualización | Tags |
-|----|--------|--------|-----------|----------------------|------|
-| *Vacío* | *Usa `bujo-note: "título"` para crear la primera nota* | | | | |
-
-> **Convención de nombres:** `NXX-slug-kebab-case.md` (ej. `N01-arquitectura-multi-tenant.md`). El ID nunca lleva guion interno.
+| ID  | Título                                | Estado | Prioridad | Updated    | Tags                        |
+|-----|---------------------------------------|--------|-----------|------------|-----------------------------|
+| N01 | Rotación de Token y Blindaje          | done   | high      | 2026-10-23 | [seguridad, git, bootstrap] |
+| N02 | Capas de Conocimiento (BuJo)          | open   | normal    | 2026-10-23 | [arquitectura, documentacion] |
