@@ -39,3 +39,21 @@ Thumbs.db
 # Build
 build/
 *.egg-info/
+
+# Dependencias y entornos virtuales
+venv/
+__pycache__/
+.venv/
+poetry.lock
+
+# Secretos y Entornos
+.env
+.env.*
+!.env.example
+
+# Notas locales sensibles o respaldos
+docs/secure-notes/*.md
+!docs/secure-notes/README.md
+docs/secure-notes/credentials-mapping.md
+*.enc
+

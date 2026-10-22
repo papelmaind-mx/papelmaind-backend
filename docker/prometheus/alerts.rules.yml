@@ -1,0 +1,20 @@
+# Alertas Prometheus (canon: 15 alertas) — núcleo P0
+groups:
+  - name: papelmind-core
+    rules:
+      - alert: API down
+        expr: up{job="papelmind-api"} == 0
+        for: 1m
+        labels: {severidad: critical}
+      - alert: Outbox backlog
+        expr: erp_outbox_pending_events_count > 1000
+        for: 5m
+        labels: {severidad: warning}
+      - alert: FEFO latency
+        expr: erp_fefo_allocation_latency_seconds_p95 > 2
+        for: 1m
+        labels: {severidad: critical}
+      - alert: DLQ creciendo
+        expr: increase(erp_outbox_dlq_total[15m]) > 10
+        for: 5m
+        labels: {severidad: warning}

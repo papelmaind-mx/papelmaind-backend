@@ -1,0 +1,54 @@
+# PapelMaind — docker-compose P0 (canon: VPS + docker-compose)
+# API en 8000 · PostgreSQL 16 en 5433 · Redis 7
+# Nota: en este entorno de desarrollo SIN Docker se usa SQLite nativo (ver .env.example).
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: papelmind-db
+    environment:
+      POSTGRES_USER: papelmind
+      POSTGRES_PASSWORD: papelmind
+      POSTGRES_DB: papelmind
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./docker/init-scripts:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U papelmind"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: papelmind-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: papelmind-api
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+asyncpg://papelmind:papelmind@db:5432/papelmind
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET:-cambiar-en-produccion}
+      APP_ENV: production
+    ports:
+      - "8000:8000"
+    command: sh -c "python -m src.infrastructure.db.migrate apply && python -m src.infrastructure.db.seed && uvicorn src.main:app --host 0.0.0.0 --port 8000"
+
+volumes:
+  pgdata:

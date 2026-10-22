@@ -1,0 +1,33 @@
+# PapelMaind — compose producción (P0: VPS)
+# Requiere: .env con JWT_SECRET fuerte y DATABASE_URL de producción
+services:
+  api:
+    build: {context: ./backend}
+    restart: always
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: redis://redis:6379/0
+      JWT_SECRET: ${JWT_SECRET}
+      APP_ENV: production
+    ports: ["8000:8000"]
+    depends_on: [db, redis]
+    command: sh -c "python -m src.infrastructure.db.migrate apply && uvicorn src.main:app --host 0.0.0.0 --port 8000 --workers 2"
+  db:
+    image: postgres:16-alpine
+    restart: always
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: papelmind
+    volumes:
+      - pgdata-prod:/var/lib/postgresql/data
+      - ./docker/init-scripts:/docker-entrypoint-initdb.d:ro
+  redis:
+    image: redis:7-alpine
+    restart: always
+  prometheus:
+    image: prom/prometheus:latest
+    volumes: ["./docker/prometheus:/etc/prometheus:ro"]
+    ports: ["9090:9090"]
+volumes:
+  pgdata-prod:

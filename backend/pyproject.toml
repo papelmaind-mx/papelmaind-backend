@@ -1,0 +1,35 @@
+# PapelMaind — config global del monorepo (canon Sección 11)
+[project]
+name = "papelmind-backend"
+version = "2.3.0"
+description = "PapelMaind — Plataforma Omnicanal Multi-Tenant para Cadenas de Papelerías"
+requires-python = ">=3.12"
+readme = "README.md"
+license = { text = "Propietaria" }
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["backend"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["B008"]  # FastAPI Depends() en defaults es idiomático
+
+[tool.mypy]
+python_version = "3.12"
+ignore_missing_imports = true
+warn_unused_ignores = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["backend/tests"]
+pythonpath = ["backend"]
+addopts = "-q"
+
+[tool.coverage.run]
+source = ["backend/src"]
+omit = ["*/tests/*"]
+
+[tool.bandit]
+exclude_dirs = ["backend/tests"]

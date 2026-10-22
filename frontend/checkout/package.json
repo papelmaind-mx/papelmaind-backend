@@ -1,0 +1,7 @@
+{
+  "name": "papelmind-checkout",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {"dev": "vite", "build": "vite build"},
+  "dependencies": {"react": "^18.3.0", "zustand": "^4.5.0", "mercadopago": "^1.0.0"}
+}
