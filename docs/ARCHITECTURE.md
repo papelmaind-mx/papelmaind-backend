@@ -1,4 +1,68 @@
+-- Tabla para almacenar la configuración de IA específica de cada tenant (BYO-LLM)
+CREATE TABLE IF NOT EXISTS ttenants_config_ia (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES ttenants(id) ON DELETE CASCADE,
+    proveedor_llm VARCHAR(50) DEFAULT 'local', -- 'openai', 'anthropic', 'deepseek', 'local'
+    modelo_llm VARCHAR(100) DEFAULT 'llama3',
+    api_key_llm TEXT, -- Llave cifrada o en texto según política
+    prompt_sistema TEXT,
+    activo BOOLEAN DEFAULT TRUE,
+    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    actualizado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_tenant_config UNIQUE (tenant_id)
+);
+
+-- Tabla para registrar conversaciones que requieren handoff a un operador humano (Admin / Superadmin)
+CREATE TABLE IF NOT EXISTS tconversaciones_escaladas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES ttenants(id) ON DELETE CASCADE,
+    conversacion_id VARCHAR(100) NOT NULL,
+    cliente_id VARCHAR(100),
+    motivo TEXT,
+    estado VARCHAR(20) DEFAULT 'PENDIENTE', -- 'PENDIENTE', 'EN_ATENCION', 'RESUELTO'
+    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Habilitar RLS en las nuevas tablas
+ALTER TABLE ttenants_config_ia ENABLE ROW LEVEL SECURITY;
+ALTER TABLE tconversaciones_escaladas ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_policy ON ttenants_config_ia
+    USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
+CREATE POLICY tenant_isolation_policy ON tconversaciones_escaladas
+    USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
+//crear base de datos local conectarla a nube probar 
+// DDL de Soporte para Idempotencia (ttransacciones_offline_procesadas)Para que el mecanismo de idempotencia funcione a nivel de base de datos con seguridad RLS, asegúrate de incluir esta tabla en tus migraciones de PostgreSQL:   
+
+CREATE TABLE IF NOT EXISTS ttransacciones_offline_procesadas (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id UUID NOT NULL REFERENCES ttenants(id) ON DELETE CASCADE,
+    idempotency_key VARCHAR(255) NOT NULL UNIQUE,
+    sucursal_id UUID NOT NULL,
+    monto_total NUMERIC(12, 2) NOT NULL,
+    estado VARCHAR(50) DEFAULT 'COMPLETADO',
+    creado_en TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Habilitar RLS y políticas de aislamiento por tenant
+ALTER TABLE ttransacciones_offline_procesadas ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY tenant_isolation_policy ON ttransacciones_offline_procesadas
+    USING (tenant_id = current_setting('app.current_tenant_id', true)::uuid);
+
+
+
+
+
+
+
+
+
+
 # Arquitectura — PapelMaind
+
 
 ## Capas (CONV-05 Clean Architecture)
 
