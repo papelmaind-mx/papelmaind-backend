@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# ============================================================
+# PAPELMAIND — pre-commit hook (Zero-Trust) — v2.4
+# Bloquea el commit si hay archivos sensibles en stage.
+# ============================================================
+set -euo pipefail
+
+# Patrones de archivos sensibles (regex ERE válidas)
+PATTERN='(^|/)\.env($|\.)|(^|/)credentials|(^|/)docs/secure-notes/|\.(enc|key|pem|p12|pfx|kdbx)$|^(secrets?|tokens?|credentials)\.(json|ya?ml|txt)$|papelmaind-setup'
+
+# Excepciones deliberadas y explícitas (allowlist)
+ALLOW='(^|/)\.env\.example$|^docs/secure-notes/README\.md$|^docs/runbooks/'
+
+STAGED="$(git diff --cached --name-only --diff-filter=ACM)"
+[ -n "$STAGED" ] || exit 0
+
+OFFENDERS="$(printf '%s\n' "$STAGED" \
+  | grep -Ei "$PATTERN" \
+  | grep -Ev "$ALLOW" \
+  || true)"
+
+if [ -n "$OFFENDERS" ]; then
+  printf '\n🔴 ALTO: archivos sensibles en stage:\n'
+  printf '%s\n' "$OFFENDERS" | sed 's/^/  → /'
+  printf '\nSolución: git restore --staged <archivo>\n'
+  printf 'Commit abortado.\n'
+  exit 1
+fi
+
+exit 0

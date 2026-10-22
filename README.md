@@ -121,3 +121,14 @@ en rojo (canon Sección 12).
 
 **Propietaria** — © 2026 PapelMaind Tecnología Omnicanal S.A. de C.V.
 Todos los derechos reservados (ver `LICENSE`). Marca en trámite ante el IMPI.
+
+<!-- bootstrap-docs:start -->
+## 🧠 Sistema de conocimiento interno
+
+Capas: **RAM** (dev-log local) → **Disco** (notas BuJo `NXX`) → **BIOS** (runbooks `RB-XX`).
+
+- Arquitectura: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+- Automatización y skills: [`docs/AUTOMATIZACION-AI-SKILLS.md`](docs/AUTOMATIZACION-AI-SKILLS.md)
+- Índice de notas: [`docs/bujo/INDEX.md`](docs/bujo/INDEX.md)
+- Comandos rápidos: `make help`
+<!-- bootstrap-docs:end -->

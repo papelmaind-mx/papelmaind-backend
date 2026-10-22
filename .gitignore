@@ -58,3 +58,88 @@ docs/secure-notes/credentials-mapping.md
 docs/secure-notes/papelmaind-setup.md 
 *.enc
 
+
+# ============================================================
+# PAPELMAIND — Protección de datos sensibles (bootstrap-docs v2.4)
+# ============================================================
+# Entornos y secretos
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.enc
+*.p12
+*.pfx
+secrets/
+credentials/
+*.secret
+
+# Archivos de setup que suelen contener tokens/URLs
+papelmaind-setup*
+*credential*.md
+*secret*.md
+
+# Notas seguras / locales (nunca versionar)
+docs/secure-notes/
+!docs/secure-notes/README.md
+
+# Logs diarios y temporales
+*.log
+dev-log/
+tmp/
+temp/
+.cache/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDEs y editores
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.project
+.classpath
+.settings/
+
+# Node / JS
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.pnpm-debug.log*
+dist/
+build/
+.next/
+.nuxt/
+.out/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Otros
+*.bak
+*.tmp
+*.orig
+.sass-cache/
+.parcel-cache/
+.turbo/
+
+# GitHub / CI
+.github/workflows/*.secret.yml
