@@ -55,5 +55,6 @@ poetry.lock
 docs/secure-notes/*.md
 !docs/secure-notes/README.md
 docs/secure-notes/credentials-mapping.md
+docs/secure-notes/papelmaind-setup.md 
 *.enc
 
