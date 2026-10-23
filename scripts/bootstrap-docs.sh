@@ -571,7 +571,201 @@ SKILL
   fi
 
   # ────────────────────────────────────────────────────────────
-  # 7. Documentación de arquitectura
+  # 7. Herramientas de Gestión BuJo (bujo-new y bujo-reindex)
+  # ────────────────────────────────────────────────────────────
+  mkdir -p scripts
+
+  # --- 7.1. Script bujo-new.sh (con slugify robusto corregido) ---
+  if [ ! -f scripts/bujo-new.sh ]; then
+    cat >scripts/bujo-new.sh <<'BUJO_NEW'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+NOTES_DIR="$ROOT/docs/bujo/notes"
+TITLE="$1"
+
+if [ -z "$TITLE" ]; then 
+  echo "❌ Uso: ./scripts/bujo-new.sh 'Título de la decisión'"
+  echo "   Ej:  make bujo-new TITLE=\"Sincronización POS con idempotencia\""
+  exit 1
+fi
+
+# 1. Calcular siguiente ID (N00, N01, N02...)
+LAST_ID=$(ls "$NOTES_DIR"/N*.md 2>/dev/null | grep -oE 'N[0-9]+' | sort -V | tail -n 1 | grep -oE '[0-9]+')
+NEXT_NUM=$((10#${LAST_ID:-0} + 1))
+NEXT_ID=$(printf "N%02d" $NEXT_NUM)
+
+# 2. Generar slug kebab-case robusto (maneja tildes, mayúsculas y espacios)
+SLUG=$(echo "$TITLE" | \
+  iconv -t ascii//TRANSLIT | \
+  tr '[:upper:]' '[:lower:]' | \
+  sed -E 's/[^a-z0-9]+/-/g' | \
+  sed -E 's/^-+|-+$//g')
+
+FILENAME="$NOTES_DIR/${NEXT_ID}-${SLUG}.md"
+TODAY=$(date +%Y-%m-%d)
+
+# 3. Crear archivo con plantilla y 9 significadores
+cat > "$FILENAME" << EOF
+---
+id: $NEXT_ID
+title: "$TITLE"
+created: $TODAY
+updated: $TODAY
+place: "$(pwd)"
+tags: [pendiente]
+status: open
+priority: normal
+links: []
+---
+<!-- 1. Contexto --> <!-- 2. Alternativas --> <!-- 3. Decisión -->
+<!-- 4. Trade-offs --> <!-- 5. Suposiciones --> <!-- 6. Riesgos -->
+<!-- 7. Métricas --> <!-- 8. Referencias --> <!-- 9. Siguiente paso -->
+
+# $TITLE
+
+· 
+EOF
+
+echo "✅ Creada: $FILENAME"
+
+# 4. Regenerar índice automáticamente
+echo "🔄 Actualizando índice..."
+"$ROOT/scripts/bujo-reindex.sh"
+BUJO_NEW
+    chmod +x scripts/bujo-new.sh
+    echo "✅ Creado: scripts/bujo-new.sh (con slugify robusto)"
+  else
+    echo "⏭️  scripts/bujo-new.sh ya existe"
+  fi
+
+  # --- 7.2. Script bujo-reindex.sh ---
+  if [ ! -f scripts/bujo-reindex.sh ]; then
+    cat >scripts/bujo-reindex.sh <<'BUJO_REINDEX'
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+NOTES_DIR="$ROOT/docs/bujo/notes"
+INDEX="$ROOT/docs/bujo/INDEX.md"
+TODAY="$(date +%Y-%m-%d)"
+
+if [ ! -d "$NOTES_DIR" ]; then
+  echo "❌ No existe $NOTES_DIR"
+  exit 1
+fi
+
+# Arrays temporales
+HIGH_TMP=$(mktemp)
+MED_TMP=$(mktemp)
+LOW_TMP=$(mktemp)
+RET_TMP=$(mktemp)
+trap 'rm -f "$HIGH_TMP" "$MED_TMP" "$LOW_TMP" "$RET_TMP"' EXIT
+
+count=0
+for f in "$NOTES_DIR"/N*.md; do
+  [ -f "$f" ] || continue
+
+  # Extraer campos del frontmatter
+  id=$(sed -n '/^---$/,/^---$/p' "$f" | grep -E '^id:' | head -1 | sed 's/^id:[[:space:]]*//' | tr -d '"'"'"' | tr -d "'")
+  title=$(sed -n '/^---$/,/^---$/p' "$f" | grep -E '^title:' | head -1 | sed 's/^title:[[:space:]]*//' | sed 's/^"//;s/"$//' | sed "s/^'//;s/'$//")
+  status=$(sed -n '/^---$/,/^---$/p' "$f" | grep -E '^status:' | head -1 | sed 's/^status:[[:space:]]*//' | tr -d '"'"'"' | tr -d "'")
+  priority=$(sed -n '/^---$/,/^---$/p' "$f" | grep -E '^priority:' | head -1 | sed 's/^priority:[[:space:]]*//' | tr -d '"'"'"' | tr -d "'")
+  created=$(sed -n '/^---$/,/^---$/p' "$f" | grep -E '^created:' | head -1 | sed 's/^created:[[:space:]]*//' | tr -d '"'"'"' | tr -d "'")
+  updated=$(sed -n '/^---$/,/^---$/p' "$f" | grep -E '^updated:' | head -1 | sed 's/^updated:[[:space:]]*//' | tr -d '"'"'"' | tr -d "'")
+  tags=$(sed -n '/^---$/,/^---$/p' "$f" | grep -E '^tags:' | head -1 | sed 's/^tags:[[:space:]]*//' | tr -d '[]' | tr -d '"'"'"' | tr -d ' ')
+
+  # Defaults
+  id="${id:-?}"
+  title="${title:-sin título}"
+  status="${status:-open}"
+  priority="${priority:-normal}"
+  created="${created:-$TODAY}"
+  updated="${updated:-$TODAY}"
+  tags="${tags:--}"
+
+  row="| $id | $title | $status | $tags | $created | $updated |"
+
+  case "$status" in
+    cancelled|done)
+      echo "| $id | $title | $status | $updated |" >> "$RET_TMP"
+      ;;
+    *)
+      case "$priority" in
+        high)  echo "$updated|$row" >> "$HIGH_TMP" ;;
+        low)   echo "$updated|$row" >> "$LOW_TMP"  ;;
+        *)     echo "$updated|$row" >> "$MED_TMP"  ;;
+      esac
+      ;;
+  esac
+  count=$((count + 1))
+done
+
+# Ordenar por updated descendente
+sort_rows() {
+  local file="$1"
+  if [ -s "$file" ]; then
+    sort -t'|' -k1,1r "$file" | cut -d'|' -f2-
+  fi
+}
+
+{
+  cat << HEADER
+# 🗂️ INDEX — Capa BuJo
+
+<!-- ⚠️ AUTO-GENERADO por scripts/bujo-reindex.sh. NO EDITAR A MANO. -->
+<!-- Última regeneración: $TODAY -->
+
+## 🔴 Alta prioridad
+| ID | Título | Estado | Tags | Creada | Actualizada |
+|----|--------|--------|------|--------|-------------|
+HEADER
+  sort_rows "$HIGH_TMP" || true
+  [ -s "$HIGH_TMP" ] || echo "| — | *sin notas* | — | — | — | — |"
+
+  cat << MID
+
+## 🟡 Prioridad media
+| ID | Título | Estado | Tags | Creada | Actualizada |
+|----|--------|--------|------|--------|-------------|
+MID
+  sort_rows "$MED_TMP" || true
+  [ -s "$MED_TMP" ] || echo "| — | *sin notas* | — | — | — | — |"
+
+  cat << LOW
+
+## 🟢 Prioridad baja
+| ID | Título | Estado | Tags | Creada | Actualizada |
+|----|--------|--------|------|--------|-------------|
+LOW
+  sort_rows "$LOW_TMP" || true
+  [ -s "$LOW_TMP" ] || echo "| — | *sin notas* | — | — | — | — |"
+
+  cat << RET
+
+## ❌ Retiradas (IDs no reutilizables)
+| ID | Título | Motivo | Fecha retiro |
+|----|--------|--------|--------------|
+RET
+  if [ -s "$RET_TMP" ]; then
+    sort -t'|' -k1,1 "$RET_TMP"
+  else
+    echo "| — | *ninguna* | — | — |"
+  fi
+
+  echo ""
+  echo "---"
+  echo "*$count notas indexadas · regenerado $TODAY*"
+} > "$INDEX"
+
+echo "✅ INDEX regenerado: $count notas → $INDEX"
+BUJO_REINDEX
+    chmod +x scripts/bujo-reindex.sh
+    echo "✅ Creado: scripts/bujo-reindex.sh"
+  else
+    echo "⏭️  scripts/bujo-reindex.sh ya existe"
+  fi
+  # ────────────────────────────────────────────────────────────
+  # 8. Documentación de arquitectura
   # ────────────────────────────────────────────────────────────
   if [ ! -f docs/ARCHITECTURE.md ]; then
     cat >docs/ARCHITECTURE.md <<'EOF'
@@ -659,7 +853,7 @@ EOF
   fi
 
   # ────────────────────────────────────────────────────────────
-  # 8. .githooks/pre-commit (CORREGIDO v2.4 — regex ERE válidas + allowlist)
+  # 9. .githooks/pre-commit (CORREGIDO v2.4 — regex ERE válidas + allowlist)
   # ────────────────────────────────────────────────────────────
   if [ ! -f .githooks/pre-commit ]; then
     cat >.githooks/pre-commit <<'HOOK'
@@ -714,17 +908,17 @@ HOOK
   fi
 
   # ────────────────────────────────────────────────────────────
-  # 9. Makefile (CORREGIDO v2.4 — tabs correctos + check delega al hook)
+  # 10. Makefile (con targets BuJo)
   # ────────────────────────────────────────────────────────────
   if [ ! -f Makefile ]; then
     cat >Makefile <<'MAKE'
-.PHONY: help bootstrap check hooks
+.PHONY: help bootstrap check hooks bujo-new bujo-index
 
 .DEFAULT_GOAL := help
 
 help:           ## Muestra esta ayuda
 	@echo "Targets disponibles:"
-	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
 bootstrap:      ## Ejecuta bootstrap-docs.sh (idempotente)
 	@chmod +x scripts/bootstrap-docs.sh
@@ -737,14 +931,20 @@ hooks:          ## (Re)instala el hook pre-commit y configura core.hooksPath
 	@chmod +x .githooks/pre-commit
 	@git config core.hooksPath .githooks
 	@echo "✅ Hook instalado: .githooks/pre-commit"
+
+bujo-new:       ## Crea nueva nota BuJo (ej: make bujo-new TITLE="Mi nota")
+	@./scripts/bujo-new.sh "$(TITLE)"
+
+bujo-index:     ## Regenera el INDEX.md de la Capa BuJo
+	@./scripts/bujo-reindex.sh
 MAKE
-    echo "✅ Creado: Makefile (v2.4 con tabs correctos)"
+    echo "✅ Creado: Makefile (con targets bujo-new y bujo-index)"
   else
     echo "⏭️  Makefile ya existe (no se sobrescribe)"
   fi
 
   # ────────────────────────────────────────────────────────────
-  # 10. README — bloque idempotente
+  # 11. README — bloque idempotente
   # ────────────────────────────────────────────────────────────
   README_BLOCK='## 🧠 Sistema de conocimiento interno
 
@@ -767,7 +967,7 @@ EOF
   fi
 
   # ────────────────────────────────────────────────────────────
-  # 11. Verificación final (CORREGIDO v2.4 — patrones válidos)
+  # 12. Verificación final (CORREGIDO v2.4 — patrones válidos)
   # ────────────────────────────────────────────────────────────
   echo ""
   echo "════════════════════════════════════════════════════════"

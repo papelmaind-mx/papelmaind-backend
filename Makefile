@@ -74,3 +74,18 @@ s1-test: ## T5/T10
 
 s1-shell: ## Shell en contenedor API
 	docker compose run --rm api bash
+
+.PHONY: help bootstrap check hooks reindex
+
+reindex:          ## Regenera docs/bujo/INDEX.md desde las notas Markdown
+	@chmod +x scripts/bujo-reindex.sh
+	@./scripts/bujo-reindex.sh
+
+# Añade esto a tu Makefile existente
+
+bujo-new:       ## Crea una nueva nota BuJo (ej: make bujo-new TITLE="Mi decisión")
+	@./scripts/bujo-new.sh "$(TITLE)"
+	@./scripts/bujo-reindex.sh
+
+bujo-index:     ## Regenera el INDEX.md de la Capa BuJo
+	@./scripts/bujo-reindex.sh

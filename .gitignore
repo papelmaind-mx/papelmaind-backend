@@ -83,6 +83,7 @@ papelmaind-setup*
 # Notas seguras / locales (nunca versionar)
 docs/secure-notes/
 !docs/secure-notes/README.md
+docs/bujo/notes/
 
 # Logs diarios y temporales
 *.log
