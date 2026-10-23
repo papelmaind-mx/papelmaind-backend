@@ -6,18 +6,15 @@
 ## 🔴 Alta prioridad
 | ID | Título | Estado | Tags | Creada | Actualizada |
 |----|--------|--------|------|--------|-------------|
-| N00 | Inicio del sistema de conocimiento | open | meta,sistema | 2026-10-22 | 2026-10-22 |
-| N01 | Configuración Git: identidad, remoto y ramas de entorno | open | git,identidad,remoto,ramas,setup | 2026-10-22 | 2026-10-22 |
+| — | *sin notas* | — | — | — | — |
 
 ## 🟡 Prioridad media
 | ID | Título | Estado | Tags | Creada | Actualizada |
 |----|--------|--------|------|--------|-------------|
-| N02 | Mi segunda nota de prueba | open | prueba,bujo | 2026-10-22 | 2026-10-22 |
 | N03 | configuracion de notas | open | pendiente | 2026-10-22 | 2026-10-22 |
-| N05 | Sincronización POS con idempotencia | open | pendiente | 2026-10-22 | 2026-10-22 |
-| N06 | Prueba de slug con tildes y espacios | open | pendiente | 2026-10-22 | 2026-10-22 |
-| N07 | Prueba de slug con tildes y espacios | open | pendiente | 2026-10-22 | 2026-10-22 |
-| N08 | Decisión arquitectónica importante | open | pendiente | 2026-10-22 | 2026-10-22 |
+| N11 | github-ver-ramas | open | pendiente | 2026-10-22 | 2026-10-22 |
+| N12 | new-github-setup | open | pendiente | 2026-10-22 | 2026-10-22 |
+| N13 | papelmaind-github-setup | open | pendiente | 2026-10-22 | 2026-10-22 |
 
 ## 🟢 Prioridad baja
 | ID | Título | Estado | Tags | Creada | Actualizada |
@@ -30,4 +27,4 @@
 | — | *ninguna* | — | — |
 
 ---
-*8 notas indexadas · regenerado 2026-10-22*
+*4 notas indexadas · regenerado 2026-10-22*

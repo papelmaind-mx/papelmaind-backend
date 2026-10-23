@@ -1,22 +1,22 @@
-.PHONY: help bootstrap check hooks reindex
+.PHONY: help bootstrap check hooks bujo-new bujo-index
 .DEFAULT_GOAL := help
 
-help: ## Muestra esta ayuda
-	@echo "Targets disponibles:"
-	@grep -E '^[a-zA-Z_-]+:.*##' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
+help: ## Muestra ayuda
+	@grep -E '^[a-zA-Z_-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "}; {printf "  %-14s %s\n", $$1, $$2}'
 
-bootstrap: ## Ejecuta bootstrap-docs.sh (idempotente)
-	@chmod +x scripts/bootstrap-docs.sh
-	@./scripts/bootstrap-docs.sh
+bootstrap: ## Instala/actualiza la estructura (idempotente)
+	@bash scripts/bootstrap-docs.sh
 
-check: ## Verifica que no haya archivos sensibles en stage
-	@bash .githooks/pre-commit && echo "✅ Limpio: no hay archivos sensibles en stage"
+check: ## Verifica que no haya sensibles en stage
+	@bash .githooks/pre-commit && echo "✅ Limpio: nada sensible en stage"
 
-hooks: ## (Re)instala el hook pre-commit
+hooks: ## Activa los hooks versionados
 	@chmod +x .githooks/pre-commit
 	@git config core.hooksPath .githooks
-	@echo "✅ Hook instalado: .githooks/pre-commit"
+	@echo "✅ Hook activo: .githooks/pre-commit"
 
-reindex: ## Regenera docs/bujo/INDEX.md desde frontmatters
-	@chmod +x scripts/bujo-reindex.sh
-	@./scripts/bujo-reindex.sh
+bujo-new: ## Crea nota: make bujo-new TITLE="Mi decisión"
+	@bash scripts/bujo-new.sh "$(TITLE)"
+
+bujo-index: ## Regenera docs/bujo/INDEX.md
+	@bash scripts/bujo-reindex.sh
