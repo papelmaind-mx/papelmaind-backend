@@ -1,4 +1,4 @@
-.PHONY: help bootstrap check hooks bujo-new bujo-index
+.PHONY: help bootstrap check hooks bujo-new bujo-index edit
 .DEFAULT_GOAL := help
 
 help: ## Muestra ayuda
@@ -20,3 +20,8 @@ bujo-new: ## Crea nota: make bujo-new TITLE="Mi decisión"
 
 bujo-index: ## Regenera docs/bujo/INDEX.md
 	@bash scripts/bujo-reindex.sh
+
+.PHONY: help bootstrap check hooks bujo-new bujo-index edit
+
+edit:           ## Abre nota BuJo (sin arg=última | make edit ID=N05 | make edit PICK=1)
+	@./scripts/bujo-open.sh $(if $(ID),--id $(ID),) $(if $(PICK),--pick,)
