@@ -1,12 +1,13 @@
 # 🗂️ INDEX — Capa BuJo
 
 <!-- ⚠️ AUTO-GENERADO por scripts/bujo-reindex.sh. NO EDITAR A MANO. -->
-<!-- Última regeneración: 2026-10-22 -->
+<!-- Última regeneración: 2026-10-23 -->
 
 ## 🔴 Alta prioridad
 | ID | Título | Estado | Tags | Creada | Actualizada |
 |----|--------|--------|------|--------|-------------|
-| — | *sin notas* | — | — | — | — |
+| N00 | Inicio del sistema de conocimiento | open | meta,sistema | 2026-10-22 | 2026-10-22 |
+| N01 | Configuración Git: identidad, remoto y ramas de entorno | open | git,identidad,remoto,ramas,setup | 2026-10-22 | 2026-10-22 |
 
 ## 🟡 Prioridad media
 | ID | Título | Estado | Tags | Creada | Actualizada |
@@ -27,4 +28,4 @@
 | — | *ninguna* | — | — |
 
 ---
-*4 notas indexadas · regenerado 2026-10-22*
+*6 notas indexadas · regenerado 2026-10-23*
