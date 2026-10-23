@@ -12,6 +12,8 @@
 ## 🟡 Prioridad media
 | ID | Título | Estado | Tags | Creada | Actualizada |
 |----|--------|--------|------|--------|-------------|
+| N14 | Revisar idempotencia del retry con backoff | open | pendiente | 2026-10-23 | 2026-10-23 |
+| N15 | Idea o decisión | open | pendiente | 2026-10-23 | 2026-10-23 |
 | N03 | configuracion de notas | open | pendiente | 2026-10-22 | 2026-10-22 |
 | N11 | github-ver-ramas | open | pendiente | 2026-10-22 | 2026-10-22 |
 | N12 | new-github-setup | open | pendiente | 2026-10-22 | 2026-10-22 |
@@ -28,4 +30,4 @@
 | — | *ninguna* | — | — |
 
 ---
-*6 notas indexadas · regenerado 2026-10-23*
+*8 notas indexadas · regenerado 2026-10-23*
