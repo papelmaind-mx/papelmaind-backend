@@ -144,3 +144,5 @@ htmlcov/
 
 # GitHub / CI
 .github/workflows/*.secret.yml
+*.bak*
+scripts/*.bak*
