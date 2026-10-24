@@ -146,3 +146,4 @@ htmlcov/
 .github/workflows/*.secret.yml
 *.bak*
 scripts/*.bak*
+papelmaind-setup.md
