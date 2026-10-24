@@ -130,5 +130,5 @@ Capas: **RAM** (dev-log local) → **Disco** (notas BuJo `NXX`) → **BIOS** (ru
 - Arquitectura: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
 - Automatización y skills: [`docs/AUTOMATIZACION-AI-SKILLS.md`](docs/AUTOMATIZACION-AI-SKILLS.md)
 - Índice de notas: [`docs/bujo/INDEX.md`](docs/bujo/INDEX.md)
-- Comandos rápidos: `make help`
+- Comandos rápidos: `make help` · `./scripts/bujo new|open|index|list`
 <!-- bootstrap-docs:end -->
