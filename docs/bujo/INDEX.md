@@ -6,6 +6,7 @@
 ## 🔴 Alta prioridad
 | ID | Título | Estado | Tags | Creada | Actualizada |
 |----|--------|--------|------|--------|-------------|
+| N17 | Descripción clara | open | pos,sync | 2026-10-23 | 2026-10-23 |
 | N00 | Inicio del sistema de conocimiento | open | meta,sistema | 2026-10-22 | 2026-10-22 |
 | N01 | Configuración Git: identidad, remoto y ramas de entorno | open | git,identidad,remoto,ramas,setup | 2026-10-22 | 2026-10-22 |
 
@@ -31,4 +32,4 @@
 | — | *ninguna* | — | — |
 
 ---
-*9 notas indexadas · regenerado 2026-10-23*
+*10 notas indexadas · regenerado 2026-10-23*
