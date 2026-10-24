@@ -2,10 +2,21 @@
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CMD="${1:-help}"; shift || true
+
 case "$CMD" in
   new|n)       exec "$ROOT/scripts/bujo-new.sh" "$@" ;;
   open|o|edit) exec "$ROOT/scripts/bujo-open.sh" "$@" ;;
   index|i)     exec "$ROOT/scripts/bujo-reindex.sh" ;;
-  list|ls)     ls -1t "$ROOT/docs/bujo/notes"/N*.md 2>/dev/null | head -20 | sed 's|.*/||' || echo "Sin notas" ;;
-  help|*)      echo "Uso: ./scripts/bujo {new|open|index|list} [args]" ;;
+  list|ls)     ls -1t "$ROOT/docs/bujo/notes"/N*.md 2>/dev/null | head -20 || echo "Sin notas" ;;
+  help|*)      cat << 'USAGE'
+Uso: ./scripts/bujo <comando> [args]
+
+  new "Título" [PRIORITY=high] [TAGS=a,b]   Crear nota nueva
+  open                                       Abrir la última nota
+  open --id N05                              Abrir N05 (sin escribir slug)
+  open --pick                                Menú interactivo (fzf o select)
+  index                                      Regenerar INDEX.md
+  list                                       Listar últimas 20 notas
+USAGE
+  ;;
 esac
