@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CMD="${1:-help}"; shift || true
+CMD="${1:-help}"
+shift || true
 
 case "$CMD" in
-  new|n)       exec "$ROOT/scripts/bujo-new.sh" "$@" ;;
-  open|o|edit) exec "$ROOT/scripts/bujo-open.sh" "$@" ;;
-  index|i)     exec "$ROOT/scripts/bujo-reindex.sh" ;;
-  list|ls)     ls -1t "$ROOT/docs/bujo/notes"/N*.md 2>/dev/null | head -20 || echo "Sin notas" ;;
-  help|*)      cat << 'USAGE'
+new | n) exec "$ROOT/scripts/bujo-new.sh" "$@" ;;
+open | o | edit) exec "$ROOT/scripts/bujo-open.sh" "$@" ;;
+index | i) exec "$ROOT/scripts/bujo-reindex.sh" ;;
+list | ls) ls -1t "$ROOT/docs/bujo/notes"/N*.md 2>/dev/null | head -20 | sed 's|.*/||' || echo "Sin notas" ;;
+help | *)
+  cat <<'USAGE'
 Uso: ./scripts/bujo <comando> [args]
 
   new "Título" [PRIORITY=high] [TAGS=a,b]   Crear nota nueva
